@@ -4,9 +4,11 @@ const DB_SETTINGS_STORE = "settings";
 const DOWNLOAD_DIRECTORY_KEY = "download-directory";
 const ACCOUNT_KEY = "rollback-account-v1";
 const PREFERENCES_KEY = "rollback-preferences-v1";
+const OSM_TILE_SIZE = 256;
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const screens = $$(".screen");
+const maps = new WeakMap();
 const state = {
   user: null,
   preferences: { gps: false, audio: false, camera: false },
@@ -181,6 +183,7 @@ function configureHome() {
   updateCaptureCard("voice", state.preferences.audio, "생각을 목소리로");
   updateCaptureCard("camera", state.preferences.camera, "순간을 눈에 담기");
   $("#location-status").innerHTML = `<i class="status-dot"></i>${state.preferences.gps ? "위치 기록 사용 가능" : "위치 기록 꺼짐"}`;
+  renderMap(state.activeSession ? state.activeSession.route : [], state.activeSession ? state.activeSession.events : [], $("#map-canvas"));
 }
 
 function updateCaptureCard(action, enabled, description) {
@@ -295,61 +298,207 @@ function estimateAudioEventPositions(session) {
   });
 }
 
-function renderMap(route, events, target) {
-  target.replaceChildren();
-  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  svg.setAttribute("viewBox", "0 0 400 232");
-  svg.setAttribute("preserveAspectRatio", "none");
-  if (!route || route.length === 0) {
-    target.append(svg);
+function renderMap(route, events, target, onEventClick) {
+  let map = maps.get(target);
+  if (!map) {
+    const tiles = document.createElement("div");
+    tiles.className = "osm-tiles";
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.classList.add("osm-route");
+    svg.setAttribute("preserveAspectRatio", "none");
+    const message = document.createElement("p");
+    message.className = "map-message";
+    message.setAttribute("aria-live", "polite");
+    const attribution = document.createElement("a");
+    attribution.className = "map-attribution";
+    attribution.href = "https://www.openstreetmap.org/copyright";
+    attribution.target = "_blank";
+    attribution.rel = "noreferrer";
+    attribution.textContent = "© OpenStreetMap contributors";
+    target.replaceChildren(tiles, svg, message, attribution);
+    map = { target, tiles, svg, message, tileCache: new Map(), route: [], events: [], visibleTileKeys: [], width: 0, height: 0 };
+    maps.set(target, map);
+    if ("ResizeObserver" in window) {
+      map.resizeObserver = new ResizeObserver(() => drawMap(map));
+      map.resizeObserver.observe(target);
+    }
+  }
+  map.route = route || [];
+  map.events = events || [];
+  map.onEventClick = onEventClick || null;
+  drawMap(map);
+}
+
+function projectToWorld(point, zoom) {
+  const scale = OSM_TILE_SIZE * 2 ** zoom;
+  const latitude = Math.max(-85.05112878, Math.min(85.05112878, point.lat));
+  const sinLatitude = Math.sin(latitude * Math.PI / 180);
+  return {
+    x: (point.lon + 180) / 360 * scale,
+    y: (0.5 - Math.log((1 + sinLatitude) / (1 - sinLatitude)) / (4 * Math.PI)) * scale
+  };
+}
+
+function drawMap(map) {
+  const { target, tiles, svg, message, tileCache, route, events } = map;
+  const width = target.clientWidth;
+  const height = target.clientHeight;
+  if (!width || !height) return;
+  map.width = width;
+  map.height = height;
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  svg.replaceChildren();
+
+  const points = [...route, ...events.filter(event => event.position).map(event => event.position)];
+  if (!points.length) {
+    tiles.replaceChildren();
+    map.visibleTileKeys = [];
+    message.textContent = "경로를 기록하면 실제 지도가 표시됩니다.";
+    message.hidden = false;
     return;
   }
-  const lats = route.map(point => point.lat);
-  const lons = route.map(point => point.lon);
-  const minLat = Math.min(...lats), maxLat = Math.max(...lats);
-  const minLon = Math.min(...lons), maxLon = Math.max(...lons);
-  const latRange = maxLat - minLat || 0.001;
-  const lonRange = maxLon - minLon || 0.001;
-  const pointAt = (point) => ({
-    x: 34 + ((point.lon - minLon) / lonRange) * 332,
-    y: 198 - ((point.lat - minLat) / latRange) * 164
-  });
+
+  const availableWidth = Math.max(1, width - 72);
+  const availableHeight = Math.max(1, height - 56);
+  let zoom = 19;
+  let projected = points.map(point => projectToWorld(point, zoom));
+  while (zoom > 3) {
+    const minX = Math.min(...projected.map(point => point.x));
+    const maxX = Math.max(...projected.map(point => point.x));
+    const minY = Math.min(...projected.map(point => point.y));
+    const maxY = Math.max(...projected.map(point => point.y));
+    if (maxX - minX <= availableWidth && maxY - minY <= availableHeight) break;
+    zoom -= 1;
+    projected = points.map(point => projectToWorld(point, zoom));
+  }
+  if (points.length === 1) {
+    zoom = 16;
+    projected = points.map(point => projectToWorld(point, zoom));
+  }
+
+  const minX = Math.min(...projected.map(point => point.x));
+  const maxX = Math.max(...projected.map(point => point.x));
+  const minY = Math.min(...projected.map(point => point.y));
+  const maxY = Math.max(...projected.map(point => point.y));
+  const centerX = (minX + maxX) / 2;
+  const centerY = (minY + maxY) / 2;
+  const left = centerX - width / 2;
+  const top = centerY - height / 2;
+  const tileCount = 2 ** zoom;
+  const firstTileX = Math.floor(left / OSM_TILE_SIZE);
+  const lastTileX = Math.floor((left + width) / OSM_TILE_SIZE);
+  const firstTileY = Math.max(0, Math.floor(top / OSM_TILE_SIZE));
+  const lastTileY = Math.min(tileCount - 1, Math.floor((top + height) / OSM_TILE_SIZE));
+  const visibleKeys = [];
+
+  for (let tileY = firstTileY; tileY <= lastTileY; tileY += 1) {
+    for (let tileX = firstTileX; tileX <= lastTileX; tileX += 1) {
+      const wrappedX = ((tileX % tileCount) + tileCount) % tileCount;
+      const key = `${zoom}/${wrappedX}/${tileY}`;
+      visibleKeys.push(key);
+      let tile = tileCache.get(key);
+      if (!tile) {
+        const image = document.createElement("img");
+        image.alt = "";
+        image.draggable = false;
+        image.className = "osm-tile";
+        tile = { image, status: "loading" };
+        image.addEventListener("load", () => {
+          tile.status = "loaded";
+          updateMapMessage(map);
+        });
+        image.addEventListener("error", () => {
+          tile.status = "failed";
+          updateMapMessage(map);
+        });
+        image.src = `https://tile.openstreetmap.org/${key}.png`;
+        tileCache.set(key, tile);
+      }
+      tile.image.style.left = `${tileX * OSM_TILE_SIZE - left}px`;
+      tile.image.style.top = `${tileY * OSM_TILE_SIZE - top}px`;
+      tiles.append(tile.image);
+    }
+  }
+  map.visibleTileKeys = visibleKeys;
+  updateMapMessage(map);
+
+  const pointAt = point => {
+    const position = projectToWorld(point, zoom);
+    return { x: position.x - left, y: position.y - top };
+  };
   if (route.length > 1) {
     const path = document.createElementNS(svg.namespaceURI, "polyline");
     path.setAttribute("points", route.map(point => {
-      const p = pointAt(point);
-      return `${p.x},${p.y}`;
+      const position = pointAt(point);
+      return `${position.x},${position.y}`;
     }).join(" "));
     path.setAttribute("fill", "none");
-    path.setAttribute("stroke", "#547a5c");
+    path.setAttribute("stroke", "#345d4d");
     path.setAttribute("stroke-width", "4");
     path.setAttribute("stroke-linecap", "round");
     path.setAttribute("stroke-linejoin", "round");
     path.setAttribute("vector-effect", "non-scaling-stroke");
     svg.append(path);
   }
-  (events || []).forEach(event => {
+  events.forEach((event, index) => {
     if (!event.position) return;
-    const p = pointAt(event.position);
-    const dot = document.createElementNS(svg.namespaceURI, "circle");
-    dot.setAttribute("cx", p.x);
-    dot.setAttribute("cy", p.y);
-    dot.setAttribute("r", "6");
-    dot.setAttribute("fill", event.type === "photo" ? "#d5a445" : event.type === "video" ? "#ca785d" : "#718db2");
-    dot.setAttribute("stroke", "#fff");
-    dot.setAttribute("stroke-width", "2");
-    svg.append(dot);
+    const position = pointAt(event.position);
+    const marker = document.createElementNS(svg.namespaceURI, "circle");
+    marker.classList.add("map-event-marker");
+    marker.setAttribute("cx", position.x);
+    marker.setAttribute("cy", position.y);
+    marker.setAttribute("r", "6");
+    marker.setAttribute("fill", event.type === "photo" ? "#d5a445" : event.type === "video" ? "#ca785d" : "#718db2");
+    marker.setAttribute("stroke", "#fff");
+    marker.setAttribute("stroke-width", "2");
+    if (map.onEventClick) {
+      const typeNames = { photo: "사진", video: "동영상", audio: "음성 메모" };
+      marker.setAttribute("role", "button");
+      marker.setAttribute("tabindex", "0");
+      marker.setAttribute("aria-label", `${typeNames[event.type] || "기록"} 열기, ${formatTime(event.timestamp)}`);
+      marker.addEventListener("click", () => map.onEventClick(event));
+      marker.addEventListener("keydown", keyEvent => {
+        if (keyEvent.key !== "Enter" && keyEvent.key !== " ") return;
+        keyEvent.preventDefault();
+        map.onEventClick(event);
+      });
+    }
+    svg.append(marker);
   });
-  const p = pointAt(route.at(-1));
-  const marker = document.createElementNS(svg.namespaceURI, "circle");
-  marker.setAttribute("cx", p.x);
-  marker.setAttribute("cy", p.y);
-  marker.setAttribute("r", "6");
-  marker.setAttribute("fill", "#345d4d");
-  marker.setAttribute("stroke", "white");
-  marker.setAttribute("stroke-width", "3");
-  svg.append(marker);
-  target.append(svg);
+  if (route.length) {
+    const start = pointAt(route[0]);
+    const startMarker = document.createElementNS(svg.namespaceURI, "circle");
+    startMarker.setAttribute("cx", start.x);
+    startMarker.setAttribute("cy", start.y);
+    startMarker.setAttribute("r", "5");
+    startMarker.setAttribute("fill", "#fff");
+    startMarker.setAttribute("stroke", "#345d4d");
+    startMarker.setAttribute("stroke-width", "3");
+    svg.append(startMarker);
+    const end = pointAt(route.at(-1));
+    const endMarker = document.createElementNS(svg.namespaceURI, "circle");
+    endMarker.setAttribute("cx", end.x);
+    endMarker.setAttribute("cy", end.y);
+    endMarker.setAttribute("r", "6");
+    endMarker.setAttribute("fill", "#345d4d");
+    endMarker.setAttribute("stroke", "#fff");
+    endMarker.setAttribute("stroke-width", "2");
+    svg.append(endMarker);
+  }
+}
+
+function updateMapMessage(map) {
+  const visibleTiles = (map.visibleTileKeys || []).map(key => map.tileCache.get(key));
+  const finished = visibleTiles.filter(tile => tile && tile.status !== "loading");
+  const failed = finished.filter(tile => tile.status === "failed").length;
+  if (!visibleTiles.length || visibleTiles.some(tile => !tile || tile.status === "loading") || !failed) {
+    map.message.hidden = true;
+    return;
+  }
+  map.message.textContent = failed === visibleTiles.length
+    ? "지도를 불러오지 못했습니다. 인터넷 연결을 확인해 주세요."
+    : "일부 지도 타일을 불러오지 못했습니다.";
+  map.message.hidden = false;
 }
 
 function setRecordingUi() {
@@ -1012,8 +1161,8 @@ async function showSessionDetail(id) {
     state.reviewSession = session;
     estimateAudioEventPositions(session);
     detail.classList.remove("hidden");
-    detail.innerHTML = `<div class="detail-heading"><div><strong>${safeText(session.date.replaceAll("-", ""))}_${session.sequence || 1}</strong><small>${formatDate(session.startedAt)} · ${formatTime(session.startedAt)} 시작</small></div><button class="delete-session" type="button">이 기록 삭제</button></div><div class="map-card"><div class="map-topline"><span>기록된 여정</span><span>${session.route.length}개 위치</span></div><div class="map-canvas detail-map"></div><div class="map-bottomline"><span>노랑 사진 · 빨강 동영상 · 파랑 음성</span><span>N ↑</span></div></div><div class="event-list"></div>`;
-    renderMap(session.route, session.events, $(".detail-map", detail));
+    detail.innerHTML = `<div class="detail-heading"><div><strong>${safeText(session.date.replaceAll("-", ""))}_${session.sequence || 1}</strong><small>${formatDate(session.startedAt)} · ${formatTime(session.startedAt)} 시작</small></div><button class="delete-session" type="button">이 기록 삭제</button></div><div class="map-card"><div class="map-topline"><span>기록된 여정</span><span>${session.route.length}개 위치</span></div><div class="map-canvas detail-map" role="group" aria-label="기록된 이동 경로와 OpenStreetMap 지도"></div><div class="map-bottomline"><span>노랑 사진 · 빨강 동영상 · 파랑 음성</span><span>N ↑</span></div></div><div class="event-list"></div>`;
+    renderMap(session.route, session.events, $(".detail-map", detail), openEvent);
     const eventList = $(".event-list", detail);
     if (!session.events.length) {
       eventList.innerHTML = '<div class="empty-state">이 기록에 연결된 사진·동영상·음성 메모가 없습니다.</div>';
