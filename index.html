@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#f5f1e9">
+    <meta name="description" content="오늘의 순간을 기록하고, 다시 꺼내 보는 Roll Back">
+    <title>Roll Back — 오늘을 기록하다</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <main id="app" class="app-shell">
+      <section id="login-screen" class="screen login-screen" aria-labelledby="login-title">
+        <div class="login-card">
+          <div class="brand brand-light"><span class="brand-mark">↶</span><span>ROLL BACK</span></div>
+          <p class="eyebrow">YOUR PERSONAL MEMORY ARCHIVE</p>
+          <h1 id="login-title">오늘을 기록하고,<br>다시 꺼내보다.</h1>
+          <p class="login-copy">지나온 시간과 순간을 나만의 기록으로 남겨보세요.</p>
+          <form id="login-form">
+            <label class="field-label" for="user-id">아이디</label>
+            <input id="user-id" name="user-id" autocomplete="username" placeholder="아이디를 입력하세요" required maxlength="32">
+            <label class="field-label" for="password">비밀번호</label>
+            <input id="password" name="password" type="password" autocomplete="current-password" placeholder="비밀번호를 입력하세요" required minlength="4" maxlength="64">
+            <p id="login-message" class="form-message" aria-live="polite"></p>
+            <button class="button button-dark button-wide" type="submit" id="login-submit">기록하러 가기 <span>↗</span></button>
+          </form>
+          <button id="create-account" class="text-button" type="button">처음이신가요? 이 기기에 계정 만들기</button>
+          <p class="privacy-note">기록과 계정은 이 기기의 브라우저에만 저장됩니다.</p>
+        </div>
+        <div class="login-caption">A LITTLE TIME CAPSULE, JUST FOR YOU.</div>
+      </section>
+
+      <section id="settings-screen" class="screen inner-screen hidden" aria-labelledby="settings-title">
+        <header class="topbar">
+          <div class="brand"><span class="brand-mark">↶</span><span>ROLL BACK</span></div>
+          <button class="icon-button" type="button" data-action="logout" aria-label="로그아웃">↗</button>
+        </header>
+        <div class="content settings-content">
+          <p class="eyebrow">FIRST, MAKE IT YOURS</p>
+          <h1 id="settings-title">기록할 준비를<br>해볼까요?</h1>
+          <p class="muted">사용할 기능을 선택해 주세요.<br>필요한 권한은 기능을 쓸 때 요청합니다.</p>
+          <div class="permission-list">
+            <label class="permission-card">
+              <span class="permission-icon gps-icon">⌖</span>
+              <span class="permission-text"><strong>위치 기록</strong><small>이동 경로와 현재 위치를 남겨요</small></span>
+              <input type="checkbox" class="permission-toggle" id="setting-gps">
+              <span class="toggle-ui"></span>
+            </label>
+            <label class="permission-card">
+              <span class="permission-icon audio-icon">♫</span>
+              <span class="permission-text"><strong>음성 메모</strong><small>그 순간의 목소리와 생각을 담아요</small></span>
+              <input type="checkbox" class="permission-toggle" id="setting-audio">
+              <span class="toggle-ui"></span>
+            </label>
+            <label class="permission-card">
+              <span class="permission-icon camera-icon">▧</span>
+              <span class="permission-text"><strong>카메라</strong><small>사진과 동영상으로 순간을 남겨요</small></span>
+              <input type="checkbox" class="permission-toggle" id="setting-camera">
+              <span class="toggle-ui"></span>
+            </label>
+          </div>
+          <p class="camera-tip">사진·동영상에 위치를 함께 남기려면 기기 카메라의 위치 태그도 켜주세요.</p>
+          <p id="settings-message" class="form-message" aria-live="polite"></p>
+          <button id="start-app" class="button button-dark button-wide" type="button">시작하기 <span>→</span></button>
+        </div>
+        <p class="screen-footnote">당신의 기록은 당신의 기기 안에 안전하게.</p>
+      </section>
+
+      <section id="home-screen" class="screen inner-screen hidden" aria-labelledby="home-title">
+        <header class="topbar">
+          <div class="brand"><span class="brand-mark">↶</span><span>ROLL BACK</span></div>
+          <button class="avatar-button" type="button" data-action="settings" aria-label="기능 설정">●</button>
+        </header>
+        <div class="content home-content">
+          <div class="home-heading">
+            <div><p class="eyebrow" id="today-label"></p><h1 id="home-title">오늘의 여정</h1></div>
+            <span class="live-dot" id="recording-indicator" hidden></span>
+          </div>
+          <div class="map-card">
+            <div class="map-topline"><span id="location-status"><i class="status-dot"></i> 위치 대기 중</span><span id="point-count">경로 기록 전</span></div>
+            <div id="map-canvas" class="map-canvas" role="img" aria-label="오늘의 이동 경로 지도"></div>
+            <div class="map-bottomline"><span id="coordinate-label">위치 기록을 시작해 보세요</span><span class="map-compass">N ↑</span></div>
+          </div>
+          <div class="record-controls">
+            <button id="record-toggle" class="button button-dark" type="button"><span class="button-symbol">▶</span><span id="record-toggle-label">출발</span></button>
+            <button id="pause-recording" class="button button-outline" type="button" disabled><span class="button-symbol">Ⅱ</span><span id="pause-label">일시정지</span></button>
+            <button id="save-record" class="button button-save" type="button"><span class="button-symbol">↓</span><span>저장</span></button>
+          </div>
+          <div class="section-heading"><div><p class="eyebrow">CAPTURE THE MOMENT</p><h2>지금, 남겨두기</h2></div><span class="soft-label">꺼진 기능은 눌러 설정에서 켜기</span></div>
+          <div class="capture-grid">
+            <button class="capture-card" type="button" data-action="voice"><span class="capture-icon voice-icon">♫</span><strong>음성 메모</strong><small>생각을 목소리로</small><span class="card-arrow">↗</span></button>
+            <button class="capture-card" type="button" data-action="camera"><span class="capture-icon photo-icon">▧</span><strong>사진 · 동영상</strong><small>순간을 눈에 담기</small><span class="card-arrow">↗</span></button>
+          </div>
+          <button id="open-review" class="review-banner" type="button"><span class="review-stamp">↶</span><span><small>MEMORIES, WAITING FOR YOU</small><strong>들춰보기</strong><em>날짜별 기록과 여정을 다시 만나보세요</em></span><span class="banner-arrow">→</span></button>
+        </div>
+        <nav class="bottom-nav" aria-label="주요 메뉴"><button class="nav-item active" type="button" data-action="home"><span>⌂</span>기록</button><button class="nav-item" type="button" data-action="review"><span>◷</span>들춰보기</button></nav>
+      </section>
+
+      <section id="review-screen" class="screen inner-screen hidden" aria-labelledby="review-title">
+        <header class="topbar">
+          <button class="back-button" type="button" data-action="home" aria-label="기록 화면으로">←</button>
+          <div class="brand"><span class="brand-mark">↶</span><span>ROLL BACK</span></div>
+          <span class="topbar-spacer"></span>
+        </header>
+        <div class="content review-content">
+          <p class="eyebrow">YOUR MEMORY ARCHIVE</p>
+          <h1 id="review-title">들춰보기</h1>
+          <p class="muted">날짜를 골라 그날의 기록을 다시 만나보세요.</p>
+          <label class="field-label" for="review-date">기록 날짜</label>
+          <input id="review-date" class="date-input" type="date">
+          <div id="review-list" class="review-list"></div>
+          <div id="review-detail" class="review-detail hidden"></div>
+          <button id="review-close" class="button button-outline button-wide" type="button">오늘의 기록으로</button>
+        </div>
+        <nav class="bottom-nav" aria-label="주요 메뉴"><button class="nav-item" type="button" data-action="home"><span>⌂</span>기록</button><button class="nav-item active" type="button" data-action="review"><span>◷</span>들춰보기</button></nav>
+      </section>
+    </main>
+
+    <div id="modal-root"></div>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="app.js?v=11"></script>
+  </body>
+</html>
