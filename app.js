@@ -1090,6 +1090,32 @@ function openEvent(event) {
       });
       body.append(download);
     }
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "button button-outline button-wide delete-media";
+    remove.textContent = "이 파일 삭제";
+    remove.addEventListener("click", async () => {
+      if (!confirm("이 음성·사진·동영상 파일을 기록에서 삭제할까요? 다운로드한 파일은 삭제되지 않습니다.")) return;
+      remove.disabled = true;
+      try {
+        const currentSession = state.reviewSession && await getSession(state.reviewSession.id);
+        if (!currentSession || currentSession.user !== state.user) {
+          throw new Error("기록을 찾을 수 없어 파일을 삭제하지 못했습니다.");
+        }
+        const eventIndex = currentSession.events.findIndex(item => item.id === event.id);
+        if (eventIndex < 0) throw new Error("파일을 찾을 수 없어 삭제하지 못했습니다.");
+        currentSession.events.splice(eventIndex, 1);
+        await saveSession(currentSession);
+        closeModal();
+        await showSessionDetail(currentSession.id);
+        showToast("파일을 기록에서 삭제했습니다.");
+      } catch (error) {
+        console.error("기록 미디어를 삭제하지 못했습니다.", error);
+        showToast(error.message || "파일을 삭제하지 못했습니다.");
+        if (remove.isConnected) remove.disabled = false;
+      }
+    });
+    body.append(remove);
   }
   if (event.position) {
     const location = document.createElement("p");
