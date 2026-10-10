@@ -1,5 +1,7 @@
 const DB_NAME = "rollback-memory-v1";
 const DB_STORE = "sessions";
+const DB_SETTINGS_STORE = "settings";
+const DOWNLOAD_DIRECTORY_KEY = "download-directory";
 const ACCOUNT_KEY = "rollback-account-v1";
 const PREFERENCES_KEY = "rollback-preferences-v1";
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -19,6 +21,10 @@ const state = {
   recorder: null,
   audioCapture: null,
   modalUrls: [],
+  downloadDirectory: null,
+  downloadDirectoryResolved: false,
+  downloadDirectoryPermission: false,
+  downloadFolderNotice: "",
   toastTimer: null,
   db: null
 };
@@ -29,10 +35,13 @@ function openDatabase() {
       reject(new Error("이 브라우저에서는 기록 저장소를 사용할 수 없습니다."));
       return;
     }
-    const request = indexedDB.open(DB_NAME, 1);
+    const request = indexedDB.open(DB_NAME, 2);
     request.onupgradeneeded = () => {
       if (!request.result.objectStoreNames.contains(DB_STORE)) {
         request.result.createObjectStore(DB_STORE, { keyPath: "id" });
+      }
+      if (!request.result.objectStoreNames.contains(DB_SETTINGS_STORE)) {
+        request.result.createObjectStore(DB_SETTINGS_STORE);
       }
     };
     request.onsuccess = () => resolve(request.result);
@@ -63,6 +72,25 @@ function getSession(id) {
     const request = state.db.transaction(DB_STORE, "readonly").objectStore(DB_STORE).get(id);
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error || new Error("기록을 불러오지 못했습니다."));
+  });
+}
+
+function getSavedDownloadDirectory() {
+  return new Promise((resolve, reject) => {
+    const request = state.db.transaction(DB_SETTINGS_STORE, "readonly")
+      .objectStore(DB_SETTINGS_STORE).get(DOWNLOAD_DIRECTORY_KEY);
+    request.onsuccess = () => resolve(request.result || null);
+    request.onerror = () => reject(request.error || new Error("저장 폴더 설정을 불러오지 못했습니다."));
+  });
+}
+
+function saveDownloadDirectory(handle) {
+  return new Promise((resolve, reject) => {
+    const transaction = state.db.transaction(DB_SETTINGS_STORE, "readwrite");
+    transaction.objectStore(DB_SETTINGS_STORE).put(handle, DOWNLOAD_DIRECTORY_KEY);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error || new Error("저장 폴더 설정을 저장하지 못했습니다."));
+    transaction.onabort = () => reject(transaction.error || new Error("저장 폴더 설정 저장이 취소되었습니다."));
   });
 }
 
@@ -406,7 +434,7 @@ async function endTracking(save) {
     const all = await getAllSessions();
     session.sequence = all.filter(item => item.date === session.date && item.user === state.user && item.id !== session.id).length + 1;
     await saveSession(session);
-    downloadSession(session);
+    await downloadSession(session);
     showToast(`${session.date.replaceAll("-", "")}_${session.sequence} 기록을 저장했어요.`);
   } else if (state.activeSession && !save) {
     showToast("기록을 저장하지 않고 종료했어요.");
@@ -424,7 +452,7 @@ async function endTracking(save) {
   renderMap([], [], $("#map-canvas"));
 }
 
-function downloadSession(session) {
+async function downloadSession(session) {
   const exportData = {
     app: "Roll Back",
     fileName: `RB${session.date.replaceAll("-", "")}_${session.sequence}`,
@@ -435,32 +463,120 @@ function downloadSession(session) {
     events: session.events.map(({ blob, ...event }) => ({ ...event, mediaStoredLocally: !!blob }))
   };
   const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: "application/json" });
+  let directory = null;
+  try {
+    directory = await ensureDownloadDirectory();
+  } catch (error) {
+    console.error("기록 내보내기 폴더를 준비하지 못했습니다.", error);
+    state.downloadFolderNotice = "폴더 저장 준비에 실패해 기본 다운로드 위치를 사용합니다.";
+  }
+  if (directory) {
+    try {
+      await saveFileToDownloadDirectory(directory, `${exportData.fileName}.json`, blob);
+      return;
+    } catch (error) {
+      console.error("기록 파일을 선택한 폴더에 저장하지 못했습니다.", error);
+      state.downloadFolderNotice = "폴더 저장에 실패해 기본 다운로드 위치를 사용합니다.";
+    }
+  }
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;
   anchor.download = `${exportData.fileName}.json`;
   anchor.click();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  if (!directory && typeof window.showDirectoryPicker === "function") state.downloadDirectoryResolved = false;
 }
 
 function mediaFilename(session, event) {
   const type = { audio: "voice", video: "video", photo: "photo" }[event.type] || "media";
   const timestamp = new Date(event.timestamp);
   const time = `${String(timestamp.getHours()).padStart(2, "0")}${String(timestamp.getMinutes()).padStart(2, "0")}${String(timestamp.getSeconds()).padStart(2, "0")}`;
-  const extension = event.type === "photo" ? "jpg" : ((event.mimeType || event.blob.type).split("/")[1]?.split(";")[0] || "webm").replace(/[^a-z0-9]/gi, "");
+  const mimeType = (event.mimeType || event.blob.type).split(";")[0].toLowerCase();
+  const extensions = {
+    "audio/mp4": "m4a",
+    "audio/mpeg": "mp3",
+    "audio/ogg": "ogg",
+    "audio/wav": "wav",
+    "audio/wave": "wav",
+    "audio/x-wav": "wav",
+    "audio/webm": "webm",
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "video/mp4": "mp4",
+    "video/ogg": "ogv",
+    "video/webm": "webm"
+  };
+  const fallbackExtension = { audio: "wav", photo: "jpg", video: "webm" }[event.type] || "bin";
+  const extension = extensions[mimeType] || fallbackExtension;
   const eventNumber = session.events.filter(item => item.type === event.type).indexOf(event) + 1;
   return `RB${session.date.replaceAll("-", "")}_${session.sequence || 1}_${type}_${time}_${eventNumber}.${extension}`;
 }
 
-function createMediaDownloadLink(event, session, className = "button button-dark") {
-  const url = URL.createObjectURL(event.blob);
-  state.modalUrls.push(url);
-  const anchor = document.createElement("a");
-  anchor.className = className;
-  anchor.href = url;
-  anchor.download = mediaFilename(session, event);
-  anchor.textContent = "파일 다운로드";
-  return anchor;
+async function ensureDownloadDirectory() {
+  if (state.downloadDirectoryResolved && !state.downloadDirectory) return null;
+  if (typeof window.showDirectoryPicker !== "function") {
+    state.downloadFolderNotice = "이 브라우저는 폴더 직접 저장을 지원하지 않아 기본 다운로드 위치에 저장합니다.";
+    state.downloadDirectoryResolved = true;
+    return null;
+  }
+
+  let selectedNow = false;
+  if (!state.downloadDirectory) {
+    try {
+      state.downloadDirectory = await window.showDirectoryPicker({ mode: "readwrite" });
+      state.downloadDirectoryResolved = true;
+      state.downloadDirectoryPermission = true;
+      selectedNow = true;
+    } catch (error) {
+      if (error.name === "AbortError") {
+        state.downloadFolderNotice = "폴더 선택을 취소해 기본 다운로드 위치에 저장합니다.";
+        state.downloadDirectoryResolved = true;
+        return null;
+      }
+      state.downloadDirectoryResolved = true;
+      throw error;
+    }
+  } else if (!state.downloadDirectoryPermission) {
+    const permission = await state.downloadDirectory.requestPermission({ mode: "readwrite" });
+    if (permission !== "granted") {
+      state.downloadFolderNotice = "폴더 저장 권한이 없어 기본 다운로드 위치에 저장합니다.";
+      state.downloadDirectoryResolved = true;
+      state.downloadDirectory = null;
+      return null;
+    }
+    state.downloadDirectoryResolved = true;
+    state.downloadDirectoryPermission = true;
+  }
+
+  const directory = await state.downloadDirectory.getDirectoryHandle("RollBack", { create: true });
+  state.downloadFolderNotice = "";
+  if (selectedNow) {
+    try {
+      await saveDownloadDirectory(state.downloadDirectory);
+    } catch (error) {
+      console.error("저장 폴더를 기억하지 못했습니다.", error);
+      state.downloadFolderNotice = "이번 저장은 선택한 폴더에 완료되지만 다음에는 폴더를 다시 선택해야 합니다.";
+    }
+  }
+  return directory;
+}
+
+async function saveFileToDownloadDirectory(directory, filename, blob) {
+  const file = await directory.getFileHandle(filename, { create: true });
+  const writable = await file.createWritable();
+  try {
+    await writable.write(blob);
+    await writable.close();
+  } catch (error) {
+    try {
+      await writable.abort();
+    } catch (abortError) {
+      console.warn("파일 쓰기 작업을 정리하지 못했습니다.", abortError);
+    }
+    throw error;
+  }
 }
 
 function startMediaDownload(event, session) {
@@ -474,6 +590,18 @@ function startMediaDownload(event, session) {
   anchor.click();
   anchor.remove();
   setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+async function saveEventMedia(event, session) {
+  if (!event.blob || !session) throw new Error("저장할 미디어 파일이 없습니다.");
+  const directory = await ensureDownloadDirectory();
+  if (directory) {
+    await saveFileToDownloadDirectory(directory, mediaFilename(session, event), event.blob);
+    return true;
+  }
+  startMediaDownload(event, session);
+  if (typeof window.showDirectoryPicker === "function") state.downloadDirectoryResolved = false;
+  return false;
 }
 
 function showCaptureResult(body, message) {
@@ -497,25 +625,64 @@ function showCaptureResult(body, message) {
 async function saveCapturedMedia(body, event, typeName) {
   const session = state.activeSession;
   const objectParticle = typeName === "음성 메모" || typeName === "사진" ? "를" : "을";
+  let directory = null;
+  let directoryError = null;
+  try {
+    directory = await ensureDownloadDirectory();
+  } catch (error) {
+    directoryError = error;
+    console.error("RollBack 저장 폴더를 준비하지 못했습니다.", error);
+  }
+  let downloadedToFolder = false;
+  let defaultDownloadStarted = false;
+  let downloadError = null;
+  if (!directory) {
+    try {
+      startMediaDownload(event, session);
+      defaultDownloadStarted = true;
+    } catch (error) {
+      downloadError = error;
+    }
+  }
   let storageError = null;
   try {
     await saveDraftOrSession();
   } catch (error) {
     storageError = error;
   }
-  try {
-    startMediaDownload(event, session);
-  } catch (error) {
+  if (directory) {
+    try {
+      await saveFileToDownloadDirectory(directory, mediaFilename(session, event), event.blob);
+      downloadedToFolder = true;
+    } catch (error) {
+      console.error("선택한 폴더에 미디어 파일을 저장하지 못했습니다.", error);
+      state.downloadFolderNotice = "선택한 폴더에 저장하지 못해 기본 다운로드 위치를 사용했습니다.";
+      try {
+        startMediaDownload(event, session);
+        defaultDownloadStarted = true;
+      } catch (fallbackError) {
+        downloadError = new Error(`${error.message}; 기본 다운로드도 실패했습니다: ${fallbackError.message}`);
+      }
+    }
+  }
+  if (downloadError && !downloadedToFolder && !defaultDownloadStarted) {
     const message = storageError
-      ? `${typeName}을 앱 기록에 저장하지 못했습니다 (${storageError.message}). 파일 다운로드도 시작하지 못했습니다 (${error.message}).`
-      : `${typeName}은 앱 기록에 저장했지만 파일 다운로드를 시작하지 못했습니다: ${error.message}`;
+      ? `${typeName}을 앱 기록에 저장하지 못했습니다 (${storageError.message}). 파일 저장도 실패했습니다 (${downloadError.message}).`
+      : `${typeName}은 앱 기록에 저장했지만 파일 저장에 실패했습니다: ${downloadError.message}`;
     showCaptureResult(body, message);
     return;
   }
-  const message = storageError
-    ? `${typeName} 파일 다운로드를 시작했습니다. 앱 기록에는 저장하지 못했습니다: ${storageError.message}`
-    : `${typeName}${objectParticle} 앱 기록에 저장하고 파일 다운로드를 시작했습니다. 다운로드가 완료된 뒤 닫기를 눌러주세요.`;
+  const destination = downloadedToFolder ? "선택한 다운로드/RollBack 폴더에 저장했습니다." : "브라우저의 기본 다운로드 위치에 저장을 시작했습니다.";
+  const folderNotice = state.downloadFolderNotice || (directoryError ? "폴더 저장 준비에 실패해 기본 다운로드 위치를 사용했습니다." : "");
+  const message = [
+    storageError
+      ? `${typeName} 파일을 저장했지만 앱 기록에는 저장하지 못했습니다: ${storageError.message}`
+      : `${typeName}${objectParticle} 앱 기록에 저장하고 ${destination}`,
+    folderNotice,
+    defaultDownloadStarted ? "파일 저장이 끝나면 닫기를 눌러주세요." : ""
+  ].filter(Boolean).join(" ");
   showCaptureResult(body, message);
+  if (!state.downloadDirectory && typeof window.showDirectoryPicker === "function") state.downloadDirectoryResolved = false;
 }
 
 function openModal(title, description = "") {
@@ -705,9 +872,16 @@ async function openVoiceModal() {
       ? "이 브라우저는 음성 녹음을 지원하지 않습니다."
       : "음성 녹음은 HTTPS로 접속해야 사용할 수 있습니다.");
   }
-  const body = openModal("음성 메모", "지금 떠오른 생각을 목소리로 남겨보세요.");
-  body.innerHTML = '<div class="preview-placeholder">녹음을 시작하면 이 순간의 목소리를 담습니다.</div><p class="form-message" id="media-message" aria-live="polite"></p><div class="modal-actions"><button class="button button-dark button-wide" type="button" id="audio-start">녹음 시작</button><button class="button button-outline button-wide" type="button" id="audio-stop" disabled>녹음 종료</button></div>';
+  const body = openModal("음성 메모", "녹음을 마치면 자동 저장됩니다. 처음에는 다운로드 폴더를 선택해 주세요.");
+  body.innerHTML = '<div class="preview-placeholder">녹음을 시작하면 이 순간의 목소리를 담습니다.</div><p class="form-message" id="media-message" aria-live="polite"></p><div class="modal-actions"><button class="button button-dark button-wide" type="button" id="audio-start">녹음 시작</button><button class="button button-outline button-wide" type="button" id="audio-stop" disabled>녹음 종료 및 저장</button></div>';
   $("#audio-start", body).addEventListener("click", async () => {
+    try {
+      await ensureDownloadDirectory();
+    } catch (error) {
+      console.error("RollBack 저장 폴더를 준비하지 못했습니다.", error);
+      $("#media-message", body).textContent = `저장 폴더를 준비하지 못했습니다: ${error.message}`;
+      return;
+    }
     let stream = null;
     let context = null;
     try {
@@ -767,9 +941,17 @@ async function openCameraModal() {
       ? "이 브라우저는 카메라를 지원하지 않습니다."
       : "카메라 사용은 HTTPS로 접속해야 합니다.");
   }
-  const body = openModal("순간 담기", "사진이나 동영상을 촬영해 기록에 저장합니다.");
+  const body = openModal("순간 담기", "촬영을 마치면 자동 저장됩니다. 처음에는 다운로드 폴더를 선택해 주세요.");
   body.innerHTML = '<div class="modal-tab-row"><button class="modal-tab active" type="button" data-mode="photo">사진</button><button class="modal-tab" type="button" data-mode="video">동영상</button></div><video class="media-preview" id="camera-preview" autoplay playsinline muted></video><p class="form-message" id="media-message" aria-live="polite"></p><div class="modal-actions"><button class="button button-dark button-wide" type="button" id="capture-action">사진 촬영</button></div>';
   let mode = "photo";
+  try {
+    await ensureDownloadDirectory();
+  } catch (error) {
+    console.error("RollBack 저장 폴더를 준비하지 못했습니다.", error);
+    $("#media-message", body).textContent = `저장 폴더를 준비하지 못했습니다: ${error.message}`;
+    $("#capture-action", body).disabled = true;
+    return;
+  }
   try {
     state.modalStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } }, audio: false });
     $("#camera-preview", body).srcObject = state.modalStream;
@@ -884,7 +1066,28 @@ function openEvent(event) {
   if (event.blob) {
     const session = state.reviewSession;
     if (session) {
-      const download = createMediaDownloadLink(event, session, "button button-outline button-wide");
+      const download = document.createElement("button");
+      download.type = "button";
+      download.className = "button button-outline button-wide";
+      download.textContent = "파일 다운로드";
+      download.addEventListener("click", async () => {
+        download.disabled = true;
+        download.textContent = "저장 중...";
+        try {
+          const savedInFolder = await saveEventMedia(event, session);
+          showToast(savedInFolder
+            ? "다운로드/RollBack 폴더에 저장했습니다."
+            : `기본 다운로드 위치에 저장을 시작했습니다. ${state.downloadFolderNotice}`);
+        } catch (error) {
+          console.error("기록 미디어를 저장하지 못했습니다.", error);
+          showToast(`파일을 저장하지 못했습니다: ${error.message}`);
+        } finally {
+          if (download.isConnected) {
+            download.disabled = false;
+            download.textContent = "파일 다운로드";
+          }
+        }
+      });
       body.append(download);
     }
   }
@@ -966,6 +1169,12 @@ async function saveActiveRecord() {
   const hasAnyData = state.activeSession.route.length || state.activeSession.events.length;
   if (!hasAnyData) return showToast("기록된 위치나 미디어가 없습니다.");
   try {
+    await ensureDownloadDirectory();
+  } catch (error) {
+    console.error("RollBack 저장 폴더를 준비하지 못했습니다.", error);
+    state.downloadFolderNotice = "폴더 저장 준비에 실패해 기본 다운로드 위치를 사용합니다.";
+  }
+  try {
     await endTracking(true);
   } catch (error) {
     showToast(`기록을 저장하지 못했습니다: ${error.message}`);
@@ -1035,6 +1244,12 @@ $$("[data-action='logout']").forEach(button => button.addEventListener("click", 
 async function initialize() {
   try {
     state.db = await openDatabase();
+    try {
+      state.downloadDirectory = await getSavedDownloadDirectory();
+    } catch (error) {
+      console.error("저장 폴더 설정을 불러오지 못했습니다.", error);
+      showToast("저장 폴더 설정을 불러오지 못했습니다. 다음 저장 시 폴더를 다시 선택해 주세요.");
+    }
     $("#review-date").value = dateKey(new Date());
   } catch (error) {
     console.error(error);
