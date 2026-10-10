@@ -22,8 +22,7 @@ const state = {
   audioCapture: null,
   modalUrls: [],
   downloadDirectory: null,
-  downloadDirectoryResolved: false,
-  downloadDirectoryPermission: false,
+  downloadTargetDirectory: null,
   downloadFolderNotice: "",
   toastTimer: null,
   db: null
@@ -463,13 +462,7 @@ async function downloadSession(session) {
     events: session.events.map(({ blob, ...event }) => ({ ...event, mediaStoredLocally: !!blob }))
   };
   const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: "application/json" });
-  let directory = null;
-  try {
-    directory = await ensureDownloadDirectory();
-  } catch (error) {
-    console.error("기록 내보내기 폴더를 준비하지 못했습니다.", error);
-    state.downloadFolderNotice = "폴더 저장 준비에 실패해 기본 다운로드 위치를 사용합니다.";
-  }
+  const directory = state.downloadTargetDirectory;
   if (directory) {
     try {
       await saveFileToDownloadDirectory(directory, `${exportData.fileName}.json`, blob);
@@ -485,7 +478,6 @@ async function downloadSession(session) {
   anchor.download = `${exportData.fileName}.json`;
   anchor.click();
   setTimeout(() => URL.revokeObjectURL(url), 60_000);
-  if (!directory && typeof window.showDirectoryPicker === "function") state.downloadDirectoryResolved = false;
 }
 
 function mediaFilename(session, event) {
@@ -514,43 +506,43 @@ function mediaFilename(session, event) {
   return `RB${session.date.replaceAll("-", "")}_${session.sequence || 1}_${type}_${time}_${eventNumber}.${extension}`;
 }
 
-async function ensureDownloadDirectory() {
-  if (state.downloadDirectoryResolved && !state.downloadDirectory) return null;
+async function setupDownloadDirectory() {
+  state.downloadTargetDirectory = null;
+  state.downloadFolderNotice = "";
   if (typeof window.showDirectoryPicker !== "function") {
     state.downloadFolderNotice = "이 브라우저는 폴더 직접 저장을 지원하지 않아 기본 다운로드 위치에 저장합니다.";
-    state.downloadDirectoryResolved = true;
     return null;
   }
 
   let selectedNow = false;
   if (!state.downloadDirectory) {
     try {
-      state.downloadDirectory = await window.showDirectoryPicker({ mode: "readwrite" });
-      state.downloadDirectoryResolved = true;
-      state.downloadDirectoryPermission = true;
+      state.downloadDirectory = await window.showDirectoryPicker({
+        id: "rollback-downloads",
+        mode: "readwrite",
+        startIn: "downloads"
+      });
       selectedNow = true;
     } catch (error) {
       if (error.name === "AbortError") {
-        state.downloadFolderNotice = "폴더 선택을 취소해 기본 다운로드 위치에 저장합니다.";
-        state.downloadDirectoryResolved = true;
+        state.downloadFolderNotice = "폴더 선택을 취소해 브라우저의 기본 다운로드 위치를 사용합니다.";
         return null;
       }
-      state.downloadDirectoryResolved = true;
       throw error;
     }
-  } else if (!state.downloadDirectoryPermission) {
-    const permission = await state.downloadDirectory.requestPermission({ mode: "readwrite" });
-    if (permission !== "granted") {
-      state.downloadFolderNotice = "폴더 저장 권한이 없어 기본 다운로드 위치에 저장합니다.";
-      state.downloadDirectoryResolved = true;
-      state.downloadDirectory = null;
-      return null;
-    }
-    state.downloadDirectoryResolved = true;
-    state.downloadDirectoryPermission = true;
+  }
+
+  let permission = await state.downloadDirectory.queryPermission({ mode: "readwrite" });
+  if (permission !== "granted") {
+    permission = await state.downloadDirectory.requestPermission({ mode: "readwrite" });
+  }
+  if (permission !== "granted") {
+    state.downloadFolderNotice = "폴더 저장 권한이 없어 브라우저의 기본 다운로드 위치를 사용합니다.";
+    return null;
   }
 
   const directory = await state.downloadDirectory.getDirectoryHandle("RollBack", { create: true });
+  state.downloadTargetDirectory = directory;
   state.downloadFolderNotice = "";
   if (selectedNow) {
     try {
@@ -561,6 +553,67 @@ async function ensureDownloadDirectory() {
     }
   }
   return directory;
+}
+
+async function getBrowserPermissionState(name) {
+  if (!navigator.permissions || !navigator.permissions.query) return "prompt";
+  try {
+    return (await navigator.permissions.query({ name })).state;
+  } catch (error) {
+    console.warn(`${name} 권한 상태를 조회하지 못했습니다.`, error);
+    return "prompt";
+  }
+}
+
+async function requestSelectedFeaturePermissions() {
+  const warnings = [];
+  if (state.preferences.gps) {
+    if (!navigator.geolocation) {
+      warnings.push("이 브라우저는 위치 기록을 지원하지 않습니다.");
+    } else {
+      try {
+        const permission = await getBrowserPermissionState("geolocation");
+        if (permission === "denied") {
+          warnings.push("위치 권한이 차단되어 있습니다. 브라우저의 사이트 설정을 확인해 주세요.");
+        } else if (permission !== "granted") {
+          await new Promise((resolve, reject) => {
+            navigator.geolocation.getCurrentPosition(resolve, reject, { maximumAge: 60_000, timeout: 10_000 });
+          });
+        }
+      } catch (error) {
+        warnings.push(error.code === 1
+          ? "위치 권한이 허용되지 않았습니다. 브라우저의 사이트 설정을 확인해 주세요."
+          : "위치 권한을 확인하지 못했습니다. 위치 기능을 사용할 때 다시 확인해 주세요.");
+      }
+    }
+  }
+
+  const captureFeatures = [
+    { enabled: state.preferences.audio, name: "마이크", constraints: { audio: true } },
+    { enabled: state.preferences.camera, name: "카메라", constraints: { video: { facingMode: { ideal: "environment" } } } }
+  ];
+  for (const feature of captureFeatures) {
+    if (!feature.enabled) continue;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      warnings.push(`이 브라우저는 ${feature.name} 기능을 지원하지 않습니다.`);
+      continue;
+    }
+    let stream = null;
+    try {
+      const permissionName = feature.name === "마이크" ? "microphone" : "camera";
+      const permission = await getBrowserPermissionState(permissionName);
+      if (permission === "denied") {
+        warnings.push(`${feature.name} 권한이 차단되어 있습니다. 브라우저의 사이트 설정을 확인해 주세요.`);
+        continue;
+      }
+      if (permission !== "granted") stream = await navigator.mediaDevices.getUserMedia(feature.constraints);
+    } catch (error) {
+      warnings.push(`${feature.name} 권한을 확인하지 못했습니다. 브라우저의 사이트 설정을 확인해 주세요.`);
+    } finally {
+      if (stream) stream.getTracks().forEach(track => track.stop());
+    }
+  }
+  return warnings;
 }
 
 async function saveFileToDownloadDirectory(directory, filename, blob) {
@@ -594,13 +647,12 @@ function startMediaDownload(event, session) {
 
 async function saveEventMedia(event, session) {
   if (!event.blob || !session) throw new Error("저장할 미디어 파일이 없습니다.");
-  const directory = await ensureDownloadDirectory();
+  const directory = state.downloadTargetDirectory;
   if (directory) {
     await saveFileToDownloadDirectory(directory, mediaFilename(session, event), event.blob);
     return true;
   }
   startMediaDownload(event, session);
-  if (typeof window.showDirectoryPicker === "function") state.downloadDirectoryResolved = false;
   return false;
 }
 
@@ -625,14 +677,7 @@ function showCaptureResult(body, message) {
 async function saveCapturedMedia(body, event, typeName) {
   const session = state.activeSession;
   const objectParticle = typeName === "음성 메모" || typeName === "사진" ? "를" : "을";
-  let directory = null;
-  let directoryError = null;
-  try {
-    directory = await ensureDownloadDirectory();
-  } catch (error) {
-    directoryError = error;
-    console.error("RollBack 저장 폴더를 준비하지 못했습니다.", error);
-  }
+  const directory = state.downloadTargetDirectory;
   let downloadedToFolder = false;
   let defaultDownloadStarted = false;
   let downloadError = null;
@@ -678,11 +723,10 @@ async function saveCapturedMedia(body, event, typeName) {
     storageError
       ? `${typeName} 파일을 저장했지만 앱 기록에는 저장하지 못했습니다: ${storageError.message}`
       : `${typeName}${objectParticle} 앱 기록에 저장하고 ${destination}`,
-    folderNotice,
+    folderNotice || (!directory ? "이 브라우저는 지정 폴더 자동 저장을 지원하지 않아 기본 다운로드 위치를 사용합니다." : ""),
     defaultDownloadStarted ? "파일 저장이 끝나면 닫기를 눌러주세요." : ""
   ].filter(Boolean).join(" ");
   showCaptureResult(body, message);
-  if (!state.downloadDirectory && typeof window.showDirectoryPicker === "function") state.downloadDirectoryResolved = false;
 }
 
 function openModal(title, description = "") {
@@ -872,16 +916,9 @@ async function openVoiceModal() {
       ? "이 브라우저는 음성 녹음을 지원하지 않습니다."
       : "음성 녹음은 HTTPS로 접속해야 사용할 수 있습니다.");
   }
-  const body = openModal("음성 메모", "녹음을 마치면 자동 저장됩니다. 처음에는 다운로드 폴더를 선택해 주세요.");
+  const body = openModal("음성 메모", "녹음을 마치면 설정한 저장 폴더에 자동 저장됩니다.");
   body.innerHTML = '<div class="preview-placeholder">녹음을 시작하면 이 순간의 목소리를 담습니다.</div><p class="form-message" id="media-message" aria-live="polite"></p><div class="modal-actions"><button class="button button-dark button-wide" type="button" id="audio-start">녹음 시작</button><button class="button button-outline button-wide" type="button" id="audio-stop" disabled>녹음 종료 및 저장</button></div>';
   $("#audio-start", body).addEventListener("click", async () => {
-    try {
-      await ensureDownloadDirectory();
-    } catch (error) {
-      console.error("RollBack 저장 폴더를 준비하지 못했습니다.", error);
-      $("#media-message", body).textContent = `저장 폴더를 준비하지 못했습니다: ${error.message}`;
-      return;
-    }
     let stream = null;
     let context = null;
     try {
@@ -941,17 +978,9 @@ async function openCameraModal() {
       ? "이 브라우저는 카메라를 지원하지 않습니다."
       : "카메라 사용은 HTTPS로 접속해야 합니다.");
   }
-  const body = openModal("순간 담기", "촬영을 마치면 자동 저장됩니다. 처음에는 다운로드 폴더를 선택해 주세요.");
+  const body = openModal("순간 담기", "촬영을 마치면 설정한 저장 폴더에 자동 저장됩니다.");
   body.innerHTML = '<div class="modal-tab-row"><button class="modal-tab active" type="button" data-mode="photo">사진</button><button class="modal-tab" type="button" data-mode="video">동영상</button></div><video class="media-preview" id="camera-preview" autoplay playsinline muted></video><p class="form-message" id="media-message" aria-live="polite"></p><div class="modal-actions"><button class="button button-dark button-wide" type="button" id="capture-action">사진 촬영</button></div>';
   let mode = "photo";
-  try {
-    await ensureDownloadDirectory();
-  } catch (error) {
-    console.error("RollBack 저장 폴더를 준비하지 못했습니다.", error);
-    $("#media-message", body).textContent = `저장 폴더를 준비하지 못했습니다: ${error.message}`;
-    $("#capture-action", body).disabled = true;
-    return;
-  }
   try {
     state.modalStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } }, audio: false });
     $("#camera-preview", body).srcObject = state.modalStream;
@@ -1195,12 +1224,6 @@ async function saveActiveRecord() {
   const hasAnyData = state.activeSession.route.length || state.activeSession.events.length;
   if (!hasAnyData) return showToast("기록된 위치나 미디어가 없습니다.");
   try {
-    await ensureDownloadDirectory();
-  } catch (error) {
-    console.error("RollBack 저장 폴더를 준비하지 못했습니다.", error);
-    state.downloadFolderNotice = "폴더 저장 준비에 실패해 기본 다운로드 위치를 사용합니다.";
-  }
-  try {
     await endTracking(true);
   } catch (error) {
     showToast(`기록을 저장하지 못했습니다: ${error.message}`);
@@ -1229,14 +1252,34 @@ $("#login-form").addEventListener("submit", async event => {
 
 $("#create-account").addEventListener("click", openCreateAccountModal);
 
-$("#start-app").addEventListener("click", () => {
+$("#start-app").addEventListener("click", async event => {
   persistPreferences();
   if (!Object.values(state.preferences).some(Boolean)) {
     return setMessage("#settings-message", "앱을 시작하려면 사용할 기능을 하나 이상 선택해 주세요.");
   }
+  const button = event.currentTarget;
+  button.disabled = true;
+  const originalText = button.innerHTML;
+  button.textContent = "권한과 저장 위치 확인 중...";
   setMessage("#settings-message", "");
-  configureHome();
-  showScreen("home-screen");
+  const notices = [];
+  try {
+    try {
+      await setupDownloadDirectory();
+    } catch (error) {
+      console.error("RollBack 저장 폴더를 준비하지 못했습니다.", error);
+      state.downloadTargetDirectory = null;
+      state.downloadFolderNotice = "저장 폴더를 준비하지 못해 브라우저의 기본 다운로드 위치를 사용합니다.";
+    }
+    if (state.downloadFolderNotice) notices.push(state.downloadFolderNotice);
+    notices.push(...await requestSelectedFeaturePermissions());
+    configureHome();
+    showScreen("home-screen");
+    if (notices.length) showToast(notices.join(" "));
+  } finally {
+    button.disabled = false;
+    button.innerHTML = originalText;
+  }
 });
 
 $("#record-toggle").addEventListener("click", startTracking);
