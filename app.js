@@ -1372,16 +1372,19 @@ function openEvent(event) {
     const url = URL.createObjectURL(event.blob);
     state.modalUrls.push(url);
     if (event.type === "photo") {
+      media.classList.add("event-media-gesture");
       const image = document.createElement("img");
       image.src = url;
       image.alt = "저장된 사진";
+      image.className = "event-media-content";
       media.append(image);
     } else {
       const player = document.createElement(event.type === "video" ? "video" : "audio");
       player.controls = true;
       player.preload = "metadata";
       player.playsInline = true;
-      player.className = event.type === "audio" ? "audio-player" : "";
+      player.className = event.type === "audio" ? "audio-player" : "event-media-content";
+      if (event.type === "video") media.classList.add("event-media-gesture");
       const source = document.createElement("source");
       source.src = url;
       source.type = event.mimeType || event.blob.type;
@@ -1391,6 +1394,9 @@ function openEvent(event) {
     }
   }
   body.append(media);
+  if (event.blob && (event.type === "photo" || event.type === "video")) {
+    installMediaGestures(media);
+  }
   if (event.blob) {
     const remove = document.createElement("button");
     remove.type = "button";
@@ -1430,6 +1436,135 @@ function openEvent(event) {
     note.textContent = "이 기록에는 위치 정보가 연결되어 있지 않습니다.";
     body.append(note);
   }
+}
+
+function installMediaGestures(viewport) {
+  const content = $(".event-media-content", viewport);
+  if (!content) return;
+  const gesture = {
+    zoom: 1,
+    x: 0,
+    y: 0,
+    pointers: new Map(),
+    active: null
+  };
+  const pointFor = event => {
+    const bounds = viewport.getBoundingClientRect();
+    return { x: event.clientX - bounds.left, y: event.clientY - bounds.top };
+  };
+  const centerFor = point => ({
+    x: point.x - viewport.clientWidth / 2,
+    y: point.y - viewport.clientHeight / 2
+  });
+  const applyTransform = () => {
+    content.style.translate = `${gesture.x}px ${gesture.y}px`;
+    content.style.scale = String(gesture.zoom);
+    viewport.classList.toggle("is-zoomed", gesture.zoom > 1);
+  };
+  const beginPinch = () => {
+    const [first, second] = [...gesture.pointers.values()];
+    const midpoint = { x: (first.x + second.x) / 2, y: (first.y + second.y) / 2 };
+    const center = centerFor(midpoint);
+    gesture.active = {
+      type: "pinch",
+      startZoom: gesture.zoom,
+      startDistance: Math.hypot(second.x - first.x, second.y - first.y),
+      anchor: {
+        x: (center.x - gesture.x) / gesture.zoom,
+        y: (center.y - gesture.y) / gesture.zoom
+      }
+    };
+  };
+  const captureGesturePointers = () => {
+    for (const pointerId of gesture.pointers.keys()) {
+      if (!viewport.hasPointerCapture(pointerId)) viewport.setPointerCapture(pointerId);
+    }
+  };
+
+  viewport.addEventListener("pointerdown", event => {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    const point = pointFor(event);
+    gesture.pointers.set(event.pointerId, point);
+    if (gesture.pointers.size === 2) {
+      beginPinch();
+      captureGesturePointers();
+      event.preventDefault();
+    } else if (gesture.pointers.size === 1) {
+      gesture.active = { type: "pending", startPoint: point };
+    }
+  });
+
+  viewport.addEventListener("pointermove", event => {
+    if (!gesture.pointers.has(event.pointerId)) return;
+    gesture.pointers.set(event.pointerId, pointFor(event));
+    if (gesture.pointers.size >= 2 && gesture.active?.type === "pinch") {
+      const [first, second] = [...gesture.pointers.values()];
+      const midpoint = { x: (first.x + second.x) / 2, y: (first.y + second.y) / 2 };
+      const distance = Math.hypot(second.x - first.x, second.y - first.y);
+      const nextZoom = Math.max(1, Math.min(6, gesture.active.startZoom * distance / gesture.active.startDistance));
+      const center = centerFor(midpoint);
+      gesture.zoom = nextZoom;
+      gesture.x = center.x - gesture.active.anchor.x * nextZoom;
+      gesture.y = center.y - gesture.active.anchor.y * nextZoom;
+      applyTransform();
+      event.preventDefault();
+    } else if (gesture.pointers.size === 1 && gesture.active?.type === "pan") {
+      const point = gesture.pointers.get(event.pointerId);
+      gesture.x = gesture.active.startX + point.x - gesture.active.startPoint.x;
+      gesture.y = gesture.active.startY + point.y - gesture.active.startPoint.y;
+      applyTransform();
+      event.preventDefault();
+    } else if (gesture.pointers.size === 1 && gesture.active?.type === "pending") {
+      const point = gesture.pointers.get(event.pointerId);
+      const deltaX = point.x - gesture.active.startPoint.x;
+      const deltaY = point.y - gesture.active.startPoint.y;
+      if (Number.isFinite(deltaX) && Number.isFinite(deltaY) && Math.hypot(deltaX, deltaY) > 4) {
+        gesture.active = {
+          type: "pan",
+          startPoint: gesture.active.startPoint,
+          startX: gesture.x,
+          startY: gesture.y
+        };
+        viewport.classList.add("is-panning");
+        captureGesturePointers();
+        gesture.x += deltaX;
+        gesture.y += deltaY;
+        applyTransform();
+        event.preventDefault();
+      }
+    }
+  });
+
+  const endPointer = event => {
+    if (!gesture.pointers.has(event.pointerId)) return;
+    gesture.pointers.delete(event.pointerId);
+    if (viewport.hasPointerCapture(event.pointerId)) viewport.releasePointerCapture(event.pointerId);
+    if (gesture.pointers.size === 1) {
+      const [point] = gesture.pointers.values();
+      gesture.active = { type: "pending", startPoint: point };
+    } else {
+      gesture.active = null;
+    }
+    viewport.classList.remove("is-panning");
+  };
+  viewport.addEventListener("pointerup", endPointer);
+  viewport.addEventListener("pointercancel", endPointer);
+
+  viewport.addEventListener("wheel", event => {
+    const nextZoom = Math.max(1, Math.min(6, gesture.zoom * Math.exp(-event.deltaY * 0.002)));
+    if (nextZoom === gesture.zoom) return;
+    const point = pointFor(event);
+    const center = centerFor(point);
+    const anchor = {
+      x: (center.x - gesture.x) / gesture.zoom,
+      y: (center.y - gesture.y) / gesture.zoom
+    };
+    gesture.zoom = nextZoom;
+    gesture.x = center.x - anchor.x * nextZoom;
+    gesture.y = center.y - anchor.y * nextZoom;
+    applyTransform();
+    event.preventDefault();
+  }, { passive: false });
 }
 
 async function openReview() {
@@ -1484,7 +1619,7 @@ async function showSessionDetail(id) {
     state.reviewSession = session;
     estimateAudioEventPositions(session);
     detail.classList.remove("hidden");
-    detail.innerHTML = `<div class="detail-heading"><div><strong>${safeText(session.date.replaceAll("-", ""))}_${session.sequence || 1}</strong><small>${formatDate(session.startedAt)} · ${formatTime(session.startedAt)} 시작</small></div><button class="delete-session" type="button">이 기록 삭제</button></div><div class="map-card"><div class="map-topline"><span>기록된 여정</span><span>${session.route.length}개 위치</span></div><div class="map-canvas detail-map" role="group" aria-label="기록된 이동 경로와 OpenStreetMap 지도. 드래그하여 이동하고 두 손가락으로 확대·축소할 수 있습니다."></div><div class="map-bottomline"><span>노랑 사진 · 빨강 동영상 · 파랑 음성</span><span>N ↑</span></div></div><div class="event-list"></div>`;
+    detail.innerHTML = `<div class="detail-heading"><div><strong>${safeText(session.date.replaceAll("-", ""))}_${session.sequence || 1}</strong><small>${formatDate(session.startedAt)} · ${formatTime(session.startedAt)} 시작</small></div><button class="delete-session" type="button">이 기록 삭제</button></div><div class="map-card"><div class="map-topline"><span>기록된 여정</span><span>${session.route.length}개 위치</span></div><div class="map-canvas detail-map" role="group" aria-label="기록된 이동 경로와 OpenStreetMap 지도. 드래그하여 이동하고 두 손가락으로 확대·축소할 수 있습니다."></div><div class="map-bottomline"><span class="map-legend"><span class="map-legend-item"><i class="event-dot photo" aria-hidden="true"></i>사진</span><span class="map-legend-item"><i class="event-dot video" aria-hidden="true"></i>동영상</span><span class="map-legend-item"><i class="event-dot audio" aria-hidden="true"></i>음성</span></span><span>N ↑</span></div></div><div class="event-list"></div>`;
     renderMap(session.route, session.events, $(".detail-map", detail), openEvent);
     const eventList = $(".event-list", detail);
     if (!session.events.length) {
