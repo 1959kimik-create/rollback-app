@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#f5f1e9">
     <meta name="description" content="오늘의 순간을 기록하고, 다시 꺼내 보는 Roll Back">
     <title>Roll Back — 오늘을 기록하다</title>
-    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="styles.css?v=3">
   </head>
   <body>
     <main id="app" class="app-shell">
@@ -24,8 +24,9 @@
             <p id="login-message" class="form-message" aria-live="polite"></p>
             <button class="button button-dark button-wide" type="submit" id="login-submit">기록하러 가기 <span>↗</span></button>
           </form>
-          <button id="create-account" class="text-button" type="button">처음이신가요? 이 기기에 계정 만들기</button>
-          <p class="privacy-note">기록과 계정은 이 기기의 브라우저에만 저장됩니다.</p>
+          <button id="create-account" class="text-button" type="button">새 계정 만들기</button>
+          <button id="recover-password" class="text-button" type="button">비밀번호 찾기</button>
+          <p class="privacy-note">여러 계정을 만들 수 있으며, 기록과 계정은 이 기기의 브라우저에만 저장됩니다.</p>
         </div>
         <div class="login-caption">A LITTLE TIME CAPSULE, JUST FOR YOU.</div>
       </section>
@@ -62,6 +63,8 @@
           <p class="camera-tip">사진·동영상에 위치를 함께 남기려면 기기 카메라의 위치 태그도 켜주세요.</p>
           <p id="settings-message" class="form-message" aria-live="polite"></p>
           <button id="start-app" class="button button-dark button-wide" type="button">시작하기 <span>→</span></button>
+          <button id="manage-recovery-code" class="recovery-code-button" type="button">비밀번호 복구 코드 발급·변경</button>
+          <button id="delete-account" class="delete-account-button" type="button">계정 삭제</button>
         </div>
         <p class="screen-footnote">당신의 기록은 당신의 기기 안에 안전하게.</p>
       </section>
@@ -78,7 +81,7 @@
           </div>
           <div class="map-card">
             <div class="map-topline"><span id="location-status"><i class="status-dot"></i> 위치 대기 중</span><span id="point-count">경로 기록 전</span></div>
-            <div id="map-canvas" class="map-canvas" role="group" aria-label="오늘의 이동 경로와 OpenStreetMap 지도"></div>
+            <div id="map-canvas" class="map-canvas" role="group" aria-label="오늘의 이동 경로와 OpenStreetMap 지도. 드래그하여 이동하고 두 손가락으로 확대·축소할 수 있습니다."></div>
             <div class="map-bottomline"><span id="coordinate-label">위치 기록을 시작해 보세요</span><span class="map-compass">N ↑</span></div>
           </div>
           <div class="record-controls">
@@ -119,6 +122,6 @@
 
     <div id="modal-root"></div>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
-    <script src="app.js?v=15"></script>
+    <script src="app.js?v=18"></script>
   </body>
 </html>

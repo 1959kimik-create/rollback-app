@@ -9,6 +9,32 @@ const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 const screens = $$(".screen");
 const maps = new WeakMap();
+function preferencesKey(user) {
+  return `${PREFERENCES_KEY}:${encodeURIComponent(user)}`;
+}
+
+function getAccounts() {
+  const rawAccounts = localStorage.getItem(ACCOUNT_KEY);
+  if (!rawAccounts) return [];
+  const saved = JSON.parse(rawAccounts);
+  if (Array.isArray(saved)) {
+    if (!saved.every(account => account && typeof account.id === "string" && typeof account.passwordHash === "string")) {
+      throw new Error("저장된 계정 정보를 읽을 수 없습니다.");
+    }
+    return saved;
+  }
+  if (!saved || typeof saved.id !== "string" || typeof saved.passwordHash !== "string") {
+    throw new Error("저장된 계정 정보를 읽을 수 없습니다.");
+  }
+  const legacyPreferences = localStorage.getItem(PREFERENCES_KEY);
+  if (legacyPreferences !== null) {
+    const key = preferencesKey(saved.id);
+    if (localStorage.getItem(key) === null) localStorage.setItem(key, legacyPreferences);
+  }
+  localStorage.setItem(ACCOUNT_KEY, JSON.stringify([saved]));
+  return [saved];
+}
+
 const state = {
   user: null,
   preferences: { gps: false, audio: false, camera: false },
@@ -103,6 +129,22 @@ function deleteSession(id) {
   });
 }
 
+function deleteUserSessions(user) {
+  return new Promise((resolve, reject) => {
+    const transaction = state.db.transaction(DB_STORE, "readwrite");
+    const request = transaction.objectStore(DB_STORE).openCursor();
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) return;
+      if (cursor.value.user === user) cursor.delete();
+      cursor.continue();
+    };
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error || new Error("계정 기록을 삭제하지 못했습니다."));
+    transaction.onabort = () => reject(transaction.error || new Error("계정 기록 삭제가 취소되었습니다."));
+  });
+}
+
 function showScreen(id) {
   screens.forEach(screen => screen.classList.toggle("hidden", screen.id !== id));
   window.scrollTo(0, 0);
@@ -150,9 +192,124 @@ async function hashPassword(password) {
   return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join("");
 }
 
+function normalizeRecoveryCode(code) {
+  return code.replace(/[\s-]/g, "").toUpperCase();
+}
+
+function addPasswordVisibilityToggles(root = document) {
+  $$('input[type="password"]', root).forEach(input => {
+    const field = document.createElement("div");
+    field.className = "password-field";
+    input.before(field);
+    field.append(input);
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "password-visibility";
+    toggle.textContent = "보기";
+    const label = root.querySelector(`label[for="${input.id}"]`);
+    const fieldName = label ? label.textContent.trim() : "비밀번호";
+    toggle.setAttribute("aria-label", `${fieldName} 표시`);
+    toggle.setAttribute("aria-pressed", "false");
+    toggle.addEventListener("click", () => {
+      const showPassword = input.type === "password";
+      input.type = showPassword ? "text" : "password";
+      toggle.textContent = showPassword ? "숨기기" : "보기";
+      toggle.setAttribute("aria-label", `${fieldName} ${showPassword ? "숨기기" : "표시"}`);
+      toggle.setAttribute("aria-pressed", String(showPassword));
+      input.focus();
+    });
+    field.append(toggle);
+  });
+}
+
+function generateRecoveryCode() {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  const hex = [...bytes].map(byte => byte.toString(16).padStart(2, "0")).join("").toUpperCase();
+  return hex.match(/.{1,8}/g).join("-");
+}
+
+function showRecoveryCode(code, message) {
+  const body = openModal("복구 코드 보관", message);
+  body.innerHTML = '<p class="recovery-warning">이 코드는 비밀번호를 잊었을 때 필요합니다. 안전한 곳에 보관하세요. 이 화면을 닫으면 다시 확인할 수 없습니다.</p><code class="recovery-code"></code><p id="recovery-code-message" class="form-message" aria-live="polite"></p><div class="modal-actions"><button class="button button-outline" type="button" id="copy-recovery-code">복사</button><button class="button button-dark" type="button" id="finish-recovery-code">확인하고 계속</button></div>';
+  $(".recovery-code", body).textContent = code;
+  $("#copy-recovery-code", body).addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(code);
+      $("#recovery-code-message", body).textContent = "복구 코드를 복사했습니다.";
+      $("#recovery-code-message", body).classList.remove("error");
+    } catch (error) {
+      console.error("복구 코드를 클립보드에 복사하지 못했습니다.", error);
+      $("#recovery-code-message", body).textContent = "복사하지 못했습니다. 코드를 길게 눌러 직접 복사해 주세요.";
+      $("#recovery-code-message", body).classList.add("error");
+    }
+  });
+  $("#finish-recovery-code", body).addEventListener("click", closeModal);
+}
+
+function openPasswordRecoveryModal() {
+  const body = openModal("비밀번호 찾기", "계정 아이디와 복구 코드를 입력해 새 비밀번호를 설정하세요.");
+  body.innerHTML = `
+    <form id="password-recovery-form">
+      <label class="field-label" for="recovery-user-id">아이디</label>
+      <input id="recovery-user-id" name="recovery-user-id" autocomplete="username" placeholder="아이디를 입력하세요" required maxlength="32">
+      <label class="field-label" for="recovery-code">복구 코드</label>
+      <input id="recovery-code" name="recovery-code" autocomplete="off" placeholder="복구 코드를 입력하세요" required>
+      <label class="field-label" for="recovery-new-password">새 비밀번호</label>
+      <input id="recovery-new-password" name="recovery-new-password" type="password" autocomplete="new-password" placeholder="4자 이상 입력하세요" required minlength="4" maxlength="64">
+      <label class="field-label" for="recovery-confirm-password">새 비밀번호 확인</label>
+      <input id="recovery-confirm-password" name="recovery-confirm-password" type="password" autocomplete="new-password" placeholder="새 비밀번호를 한 번 더 입력하세요" required minlength="4" maxlength="64">
+      <p id="password-recovery-message" class="form-message" aria-live="polite"></p>
+      <div class="modal-actions">
+        <button class="button button-outline" type="button" id="cancel-password-recovery">취소</button>
+        <button class="button button-dark" type="submit">비밀번호 재설정</button>
+      </div>
+    </form>`;
+  addPasswordVisibilityToggles(body);
+  $("#recovery-user-id", body).focus();
+  $("#cancel-password-recovery", body).addEventListener("click", closeModal);
+  $("#password-recovery-form", body).addEventListener("submit", async event => {
+    event.preventDefault();
+    const id = $("#recovery-user-id", body).value.trim();
+    const code = normalizeRecoveryCode($("#recovery-code", body).value);
+    const password = $("#recovery-new-password", body).value;
+    const confirmation = $("#recovery-confirm-password", body).value;
+    const message = $("#password-recovery-message", body);
+    if (password !== confirmation) {
+      message.textContent = "새 비밀번호가 서로 일치하지 않습니다.";
+      $("#recovery-confirm-password", body).focus();
+      return;
+    }
+    const submit = $("button[type='submit']", body);
+    submit.disabled = true;
+    try {
+      const accounts = getAccounts();
+      const account = accounts.find(item => item.id === id);
+      const codeHash = await hashPassword(code);
+      if (!account || !account.recoveryCodeHash || account.recoveryCodeHash !== codeHash) {
+        message.textContent = "아이디 또는 복구 코드가 올바르지 않습니다.";
+        return;
+      }
+      const recoveryCode = generateRecoveryCode();
+      const passwordHash = await hashPassword(password);
+      const recoveryCodeHash = await hashPassword(normalizeRecoveryCode(recoveryCode));
+      localStorage.setItem(ACCOUNT_KEY, JSON.stringify(accounts.map(item =>
+        item.id === id ? { ...item, passwordHash, recoveryCodeHash } : item
+      )));
+      closeModal();
+      showRecoveryCode(recoveryCode, "비밀번호를 변경했습니다. 다음 복구에 사용할 새 코드를 보관하세요. 이전 코드는 더 이상 사용할 수 없습니다.");
+      setMessage("#login-message", "비밀번호를 변경했습니다. 새 비밀번호로 로그인하세요.");
+    } catch (error) {
+      console.error("비밀번호를 재설정하지 못했습니다.", error);
+      message.textContent = error.message || "비밀번호를 재설정하지 못했습니다.";
+    } finally {
+      if (submit.isConnected) submit.disabled = false;
+    }
+  });
+}
+
 function readPreferences() {
   try {
-    const saved = JSON.parse(localStorage.getItem(PREFERENCES_KEY) || "{}");
+    const saved = JSON.parse(localStorage.getItem(preferencesKey(state.user)) || "{}");
     state.preferences = { gps: !!saved.gps, audio: !!saved.audio, camera: !!saved.camera };
   } catch (error) {
     console.error("기능 설정을 읽지 못했습니다.", error);
@@ -165,7 +322,7 @@ function persistPreferences() {
     audio: $("#setting-audio").checked,
     camera: $("#setting-camera").checked
   };
-  localStorage.setItem(PREFERENCES_KEY, JSON.stringify(state.preferences));
+  localStorage.setItem(preferencesKey(state.user), JSON.stringify(state.preferences));
 }
 
 function renderPreferences() {
@@ -316,8 +473,26 @@ function renderMap(route, events, target, onEventClick) {
     attribution.rel = "noreferrer";
     attribution.textContent = "© OpenStreetMap contributors";
     target.replaceChildren(tiles, svg, message, attribution);
-    map = { target, tiles, svg, message, tileCache: new Map(), route: [], events: [], visibleTileKeys: [], width: 0, height: 0 };
+    map = {
+      target,
+      tiles,
+      svg,
+      message,
+      tileCache: new Map(),
+      route: [],
+      events: [],
+      visibleTileKeys: [],
+      width: 0,
+      height: 0,
+      hasView: false,
+      userInteracted: false,
+      zoom: 3,
+      centerWorld: null,
+      pointers: new Map(),
+      gesture: null
+    };
     maps.set(target, map);
+    installMapGestures(map);
     if ("ResizeObserver" in window) {
       map.resizeObserver = new ResizeObserver(() => drawMap(map));
       map.resizeObserver.observe(target);
@@ -327,6 +502,109 @@ function renderMap(route, events, target, onEventClick) {
   map.events = events || [];
   map.onEventClick = onEventClick || null;
   drawMap(map);
+}
+
+function installMapGestures(map) {
+  const { target } = map;
+  const mapPoint = event => {
+    const bounds = target.getBoundingClientRect();
+    return { x: event.clientX - bounds.left, y: event.clientY - bounds.top };
+  };
+  const startPinch = () => {
+    const [first, second] = [...map.pointers.values()];
+    const midpoint = { x: (first.x + second.x) / 2, y: (first.y + second.y) / 2 };
+    const distance = Math.hypot(second.x - first.x, second.y - first.y);
+    map.gesture = {
+      type: "pinch",
+      startZoom: map.zoom,
+      startDistance: distance,
+      anchorWorld: {
+        x: map.centerWorld.x + midpoint.x - map.width / 2,
+        y: map.centerWorld.y + midpoint.y - map.height / 2
+      }
+    };
+  };
+
+  target.addEventListener("pointerdown", event => {
+    if (!map.hasView || (event.pointerType === "mouse" && event.button !== 0)) return;
+    if (event.target instanceof Element && event.target.closest(".map-event-marker")) return;
+    const point = mapPoint(event);
+    map.pointers.set(event.pointerId, point);
+    if (target.setPointerCapture) target.setPointerCapture(event.pointerId);
+    if (map.pointers.size === 1) {
+      map.gesture = { type: "pan", startPoint: point, startCenter: { ...map.centerWorld } };
+    } else if (map.pointers.size === 2) {
+      startPinch();
+    }
+    event.preventDefault();
+  });
+
+  target.addEventListener("pointermove", event => {
+    if (!map.pointers.has(event.pointerId)) return;
+    map.pointers.set(event.pointerId, mapPoint(event));
+    if (map.pointers.size === 1 && map.gesture?.type === "pan") {
+      const point = map.pointers.get(event.pointerId);
+      const deltaX = point.x - map.gesture.startPoint.x;
+      const deltaY = point.y - map.gesture.startPoint.y;
+      map.userInteracted = true;
+      map.centerWorld = {
+        x: map.gesture.startCenter.x - deltaX,
+        y: map.gesture.startCenter.y - deltaY
+      };
+      target.classList.add("is-dragging");
+      drawMap(map);
+    } else if (map.pointers.size >= 2 && map.gesture?.type === "pinch") {
+      const [first, second] = [...map.pointers.values()];
+      const midpoint = { x: (first.x + second.x) / 2, y: (first.y + second.y) / 2 };
+      const distance = Math.hypot(second.x - first.x, second.y - first.y);
+      const zoom = Math.max(3, Math.min(19, map.gesture.startZoom + Math.log2(distance / map.gesture.startDistance)));
+      const scale = 2 ** (zoom - map.gesture.startZoom);
+      map.zoom = zoom;
+      map.centerWorld = {
+        x: map.gesture.anchorWorld.x * scale - (midpoint.x - map.width / 2),
+        y: map.gesture.anchorWorld.y * scale - (midpoint.y - map.height / 2)
+      };
+      map.userInteracted = true;
+      target.classList.add("is-dragging");
+      drawMap(map);
+    }
+    event.preventDefault();
+  });
+
+  const endPointer = event => {
+    if (!map.pointers.has(event.pointerId)) return;
+    map.pointers.delete(event.pointerId);
+    if (target.hasPointerCapture?.(event.pointerId)) target.releasePointerCapture(event.pointerId);
+    if (map.pointers.size === 1) {
+      const [pointer] = map.pointers.values();
+      map.gesture = { type: "pan", startPoint: pointer, startCenter: { ...map.centerWorld } };
+    } else {
+      map.gesture = null;
+    }
+    if (!map.pointers.size) target.classList.remove("is-dragging");
+    event.preventDefault();
+  };
+  target.addEventListener("pointerup", endPointer);
+  target.addEventListener("pointercancel", endPointer);
+
+  target.addEventListener("wheel", event => {
+    if (!map.hasView) return;
+    event.preventDefault();
+    const point = mapPoint(event);
+    const zoom = Math.max(3, Math.min(19, map.zoom - Math.sign(event.deltaY) * 0.5));
+    const scale = 2 ** (zoom - map.zoom);
+    const anchorWorld = {
+      x: map.centerWorld.x + point.x - map.width / 2,
+      y: map.centerWorld.y + point.y - map.height / 2
+    };
+    map.zoom = zoom;
+    map.centerWorld = {
+      x: anchorWorld.x * scale - (point.x - map.width / 2),
+      y: anchorWorld.y * scale - (point.y - map.height / 2)
+    };
+    map.userInteracted = true;
+    drawMap(map);
+  }, { passive: false });
 }
 
 function projectToWorld(point, zoom) {
@@ -353,48 +631,67 @@ function drawMap(map) {
   if (!points.length) {
     tiles.replaceChildren();
     map.visibleTileKeys = [];
+    map.hasView = false;
+    map.userInteracted = false;
+    map.centerWorld = null;
+    map.pointers.clear();
+    map.gesture = null;
+    target.classList.remove("is-interactive", "is-dragging");
     message.textContent = "경로를 기록하면 실제 지도가 표시됩니다.";
     message.hidden = false;
     return;
   }
+  map.hasView = true;
+  target.classList.add("is-interactive");
 
-  const availableWidth = Math.max(1, width - 72);
-  const availableHeight = Math.max(1, height - 56);
-  let zoom = 19;
-  let projected = points.map(point => projectToWorld(point, zoom));
-  while (zoom > 3) {
+  if (!map.userInteracted || !map.centerWorld) {
+    const availableWidth = Math.max(1, width - 72);
+    const availableHeight = Math.max(1, height - 56);
+    let zoom = 19;
+    let projected = points.map(point => projectToWorld(point, zoom));
+    while (zoom > 3) {
+      const minX = Math.min(...projected.map(point => point.x));
+      const maxX = Math.max(...projected.map(point => point.x));
+      const minY = Math.min(...projected.map(point => point.y));
+      const maxY = Math.max(...projected.map(point => point.y));
+      if (maxX - minX <= availableWidth && maxY - minY <= availableHeight) break;
+      zoom -= 1;
+      projected = points.map(point => projectToWorld(point, zoom));
+    }
+    if (points.length === 1) {
+      zoom = 16;
+      projected = points.map(point => projectToWorld(point, zoom));
+    }
     const minX = Math.min(...projected.map(point => point.x));
     const maxX = Math.max(...projected.map(point => point.x));
     const minY = Math.min(...projected.map(point => point.y));
     const maxY = Math.max(...projected.map(point => point.y));
-    if (maxX - minX <= availableWidth && maxY - minY <= availableHeight) break;
-    zoom -= 1;
-    projected = points.map(point => projectToWorld(point, zoom));
-  }
-  if (points.length === 1) {
-    zoom = 16;
-    projected = points.map(point => projectToWorld(point, zoom));
+    map.zoom = zoom;
+    map.centerWorld = { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
   }
 
-  const minX = Math.min(...projected.map(point => point.x));
-  const maxX = Math.max(...projected.map(point => point.x));
-  const minY = Math.min(...projected.map(point => point.y));
-  const maxY = Math.max(...projected.map(point => point.y));
-  const centerX = (minX + maxX) / 2;
-  const centerY = (minY + maxY) / 2;
-  const left = centerX - width / 2;
-  const top = centerY - height / 2;
-  const tileCount = 2 ** zoom;
-  const firstTileX = Math.floor(left / OSM_TILE_SIZE);
-  const lastTileX = Math.floor((left + width) / OSM_TILE_SIZE);
-  const firstTileY = Math.max(0, Math.floor(top / OSM_TILE_SIZE));
-  const lastTileY = Math.min(tileCount - 1, Math.floor((top + height) / OSM_TILE_SIZE));
+  const zoom = map.zoom;
+  const left = map.centerWorld.x - width / 2;
+  const top = map.centerWorld.y - height / 2;
+  const tileZoom = Math.floor(zoom);
+  const tileScale = 2 ** (zoom - tileZoom);
+  const tileSize = OSM_TILE_SIZE * tileScale;
+  const tileLeft = left / tileScale;
+  const tileTop = top / tileScale;
+  const tileWidth = width / tileScale;
+  const tileHeight = height / tileScale;
+  const tileCount = 2 ** tileZoom;
+  const firstTileX = Math.floor(tileLeft / OSM_TILE_SIZE);
+  const lastTileX = Math.floor((tileLeft + tileWidth) / OSM_TILE_SIZE);
+  const firstTileY = Math.max(0, Math.floor(tileTop / OSM_TILE_SIZE));
+  const lastTileY = Math.min(tileCount - 1, Math.floor((tileTop + tileHeight) / OSM_TILE_SIZE));
   const visibleKeys = [];
+  tiles.replaceChildren();
 
   for (let tileY = firstTileY; tileY <= lastTileY; tileY += 1) {
     for (let tileX = firstTileX; tileX <= lastTileX; tileX += 1) {
       const wrappedX = ((tileX % tileCount) + tileCount) % tileCount;
-      const key = `${zoom}/${wrappedX}/${tileY}`;
+      const key = `${tileZoom}/${wrappedX}/${tileY}`;
       visibleKeys.push(key);
       let tile = tileCache.get(key);
       if (!tile) {
@@ -414,8 +711,10 @@ function drawMap(map) {
         image.src = `https://tile.openstreetmap.org/${key}.png`;
         tileCache.set(key, tile);
       }
-      tile.image.style.left = `${tileX * OSM_TILE_SIZE - left}px`;
-      tile.image.style.top = `${tileY * OSM_TILE_SIZE - top}px`;
+      tile.image.style.left = `${tileX * tileSize - left}px`;
+      tile.image.style.top = `${tileY * tileSize - top}px`;
+      tile.image.style.width = `${tileSize}px`;
+      tile.image.style.height = `${tileSize}px`;
       tiles.append(tile.image);
     }
   }
@@ -775,6 +1074,7 @@ function openCreateAccountModal() {
         <button class="button button-dark" type="submit">계정 만들기</button>
       </div>
     </form>`;
+  addPasswordVisibilityToggles(body);
   $("#new-user-id", body).focus();
   $("#cancel-create-account", body).addEventListener("click", closeModal);
   $("#create-account-form", body).addEventListener("submit", async event => {
@@ -793,19 +1093,23 @@ function openCreateAccountModal() {
       $("#confirm-password", body).focus();
       return;
     }
-    if (localStorage.getItem(ACCOUNT_KEY)) {
-      message.textContent = "이 기기에 계정이 이미 있습니다. 로그인해 주세요.";
-      return;
-    }
     try {
+      const accounts = getAccounts();
+      if (accounts.some(account => account.id === id)) {
+        message.textContent = "이미 사용 중인 아이디입니다. 다른 아이디를 입력해 주세요.";
+        return;
+      }
       const passwordHash = await hashPassword(password);
-      localStorage.setItem(ACCOUNT_KEY, JSON.stringify({ id, passwordHash }));
+      const recoveryCode = generateRecoveryCode();
+      const recoveryCodeHash = await hashPassword(normalizeRecoveryCode(recoveryCode));
+      localStorage.setItem(ACCOUNT_KEY, JSON.stringify([...accounts, { id, passwordHash, recoveryCodeHash }]));
       state.user = id;
       readPreferences();
       renderPreferences();
       setMessage("#login-message", "");
       closeModal();
       showScreen("settings-screen");
+      showRecoveryCode(recoveryCode, "계정 복구 코드를 만들었습니다. 비밀번호를 잊었을 때 사용할 수 있습니다.");
     } catch (error) {
       message.textContent = error.message || "계정을 만들 수 없습니다.";
     }
@@ -1146,10 +1450,29 @@ async function renderReviewList() {
       list.innerHTML = '<div class="empty-state">이 날짜에는 저장된 기록이 없어요.<br>오늘의 순간을 하나 남겨볼까요?</div>';
       return;
     }
-    list.innerHTML = sessions.map(session => `<button class="session-card" type="button" data-session-id="${safeText(session.id)}"><span class="session-icon">↶</span><span class="session-copy"><strong>${safeText(session.date.replaceAll("-", ""))}_${session.sequence || 1}</strong><small>${formatTime(session.startedAt)} · 경로 ${session.route.length}개 · 기록 ${session.events.length}개</small></span><span class="session-arrow">→</span></button>`).join("");
-    $$(".session-card", list).forEach(button => button.addEventListener("click", () => showSessionDetail(button.dataset.sessionId)));
+    list.innerHTML = sessions.map(session => `<div class="session-card"><button class="session-open" type="button" data-session-id="${safeText(session.id)}"><span class="session-icon">↶</span><span class="session-copy"><strong>${safeText(session.date.replaceAll("-", ""))}_${session.sequence || 1}</strong><small>${formatTime(session.startedAt)} · 경로 ${session.route.length}개 · 기록 ${session.events.length}개</small></span><span class="session-arrow">→</span></button><button class="session-delete" type="button" data-session-id="${safeText(session.id)}" aria-label="${safeText(session.date.replaceAll("-", ""))}_${session.sequence || 1} 기록 파일 삭제">삭제</button></div>`).join("");
+    $$(".session-open", list).forEach(button => button.addEventListener("click", () => showSessionDetail(button.dataset.sessionId)));
+    $$(".session-delete", list).forEach(button => button.addEventListener("click", () => removeReviewedSession(button.dataset.sessionId)));
   } catch (error) {
     list.innerHTML = `<div class="empty-state">${safeText(error.message)}</div>`;
+  }
+}
+
+async function removeReviewedSession(id) {
+  if (!confirm("이 기록 파일의 지도 경로와 연결된 음성·사진·동영상을 모두 삭제할까요? 다운로드한 파일은 삭제되지 않습니다.")) return;
+  try {
+    const session = await getSession(id);
+    if (!session || session.user !== state.user) throw new Error("기록을 찾을 수 없어 삭제하지 못했습니다.");
+    await deleteSession(session.id);
+    if (state.reviewSession?.id === session.id) {
+      state.reviewSession = null;
+      $("#review-detail").classList.add("hidden");
+    }
+    showToast("기록 파일을 삭제했습니다.");
+    await renderReviewList();
+  } catch (error) {
+    console.error("기록 파일을 삭제하지 못했습니다.", error);
+    showToast(error.message || "기록 파일을 삭제하지 못했습니다.");
   }
 }
 
@@ -1161,7 +1484,7 @@ async function showSessionDetail(id) {
     state.reviewSession = session;
     estimateAudioEventPositions(session);
     detail.classList.remove("hidden");
-    detail.innerHTML = `<div class="detail-heading"><div><strong>${safeText(session.date.replaceAll("-", ""))}_${session.sequence || 1}</strong><small>${formatDate(session.startedAt)} · ${formatTime(session.startedAt)} 시작</small></div><button class="delete-session" type="button">이 기록 삭제</button></div><div class="map-card"><div class="map-topline"><span>기록된 여정</span><span>${session.route.length}개 위치</span></div><div class="map-canvas detail-map" role="group" aria-label="기록된 이동 경로와 OpenStreetMap 지도"></div><div class="map-bottomline"><span>노랑 사진 · 빨강 동영상 · 파랑 음성</span><span>N ↑</span></div></div><div class="event-list"></div>`;
+    detail.innerHTML = `<div class="detail-heading"><div><strong>${safeText(session.date.replaceAll("-", ""))}_${session.sequence || 1}</strong><small>${formatDate(session.startedAt)} · ${formatTime(session.startedAt)} 시작</small></div><button class="delete-session" type="button">이 기록 삭제</button></div><div class="map-card"><div class="map-topline"><span>기록된 여정</span><span>${session.route.length}개 위치</span></div><div class="map-canvas detail-map" role="group" aria-label="기록된 이동 경로와 OpenStreetMap 지도. 드래그하여 이동하고 두 손가락으로 확대·축소할 수 있습니다."></div><div class="map-bottomline"><span>노랑 사진 · 빨강 동영상 · 파랑 음성</span><span>N ↑</span></div></div><div class="event-list"></div>`;
     renderMap(session.route, session.events, $(".detail-map", detail), openEvent);
     const eventList = $(".event-list", detail);
     if (!session.events.length) {
@@ -1172,16 +1495,7 @@ async function showSessionDetail(id) {
         button.addEventListener("click", () => openEvent(session.events.find(item => item.id === button.dataset.eventId)));
       });
     }
-    $(".delete-session", detail).addEventListener("click", async () => {
-      if (!confirm("이 기록과 연결된 미디어를 모두 삭제할까요?")) return;
-      try {
-        await deleteSession(session.id);
-        showToast("기록을 삭제했습니다.");
-        await renderReviewList();
-      } catch (error) {
-        showToast(error.message);
-      }
-    });
+    $(".delete-session", detail).addEventListener("click", () => removeReviewedSession(session.id));
     detail.scrollIntoView({ behavior: "smooth", block: "nearest" });
   } catch (error) {
     showToast(error.message);
@@ -1205,10 +1519,11 @@ $("#login-form").addEventListener("submit", async event => {
   const password = $("#password").value;
   if (!id || !password) return setMessage("#login-message", "아이디와 비밀번호를 모두 입력해 주세요.");
   try {
-    const account = JSON.parse(localStorage.getItem(ACCOUNT_KEY) || "null");
-    if (!account) return setMessage("#login-message", "먼저 이 기기에 계정을 만들어 주세요.");
+    const accounts = getAccounts();
+    if (!accounts.length) return setMessage("#login-message", "먼저 이 기기에 계정을 만들어 주세요.");
     const digest = await hashPassword(password);
-    if (account.id !== id || account.passwordHash !== digest) return setMessage("#login-message", "아이디 또는 비밀번호가 일치하지 않습니다.");
+    const account = accounts.find(item => item.id === id && item.passwordHash === digest);
+    if (!account) return setMessage("#login-message", "아이디 또는 비밀번호가 일치하지 않습니다.");
     state.user = id;
     readPreferences();
     renderPreferences();
@@ -1219,7 +1534,68 @@ $("#login-form").addEventListener("submit", async event => {
   }
 });
 
+addPasswordVisibilityToggles($("#login-form"));
+
 $("#create-account").addEventListener("click", openCreateAccountModal);
+
+$("#recover-password").addEventListener("click", openPasswordRecoveryModal);
+
+$("#manage-recovery-code").addEventListener("click", async () => {
+  const user = state.user;
+  if (!user) return;
+  try {
+    const accounts = getAccounts();
+    const account = accounts.find(item => item.id === user);
+    if (!account) throw new Error("계정을 찾을 수 없어 복구 코드를 만들지 못했습니다.");
+    if (account.recoveryCodeHash && !confirm("새 복구 코드를 만들까요? 기존 코드는 즉시 사용할 수 없게 됩니다.")) return;
+    const recoveryCode = generateRecoveryCode();
+    const recoveryCodeHash = await hashPassword(normalizeRecoveryCode(recoveryCode));
+    localStorage.setItem(ACCOUNT_KEY, JSON.stringify(accounts.map(item =>
+      item.id === user ? { ...item, recoveryCodeHash } : item
+    )));
+    showRecoveryCode(recoveryCode, account.recoveryCodeHash
+      ? "새 복구 코드를 만들었습니다. 이전 코드는 더 이상 사용할 수 없습니다."
+      : "기존 계정에 복구 코드를 만들었습니다. 비밀번호를 잊었을 때 사용할 수 있습니다.");
+  } catch (error) {
+    console.error("복구 코드를 만들지 못했습니다.", error);
+    showToast(error.message || "복구 코드를 만들지 못했습니다.");
+  }
+});
+
+$("#delete-account").addEventListener("click", async event => {
+  const user = state.user;
+  if (!user) return;
+  if (!confirm(`'${user}' 계정을 삭제할까요?\n이 계정의 저장된 모든 기록과 설정이 삭제됩니다. 진행 중인 기록은 저장되지 않으며, 다운로드한 파일은 삭제되지 않습니다.`)) return;
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    if (state.activeSession?.user === user) {
+      if (state.recording) await endTracking(false);
+      else {
+        state.activeSession = null;
+        renderMap([], [], $("#map-canvas"));
+      }
+    }
+    closeModal();
+    await deleteUserSessions(user);
+    const accounts = getAccounts().filter(account => account.id !== user);
+    localStorage.setItem(ACCOUNT_KEY, JSON.stringify(accounts));
+    localStorage.removeItem(preferencesKey(user));
+    localStorage.removeItem(PREFERENCES_KEY);
+    state.user = null;
+    state.preferences = { gps: false, audio: false, camera: false };
+    state.reviewSession = null;
+    $("#user-id").value = "";
+    $("#password").value = "";
+    showScreen("login-screen");
+    showToast("계정과 저장된 기록을 삭제했습니다.");
+  } catch (error) {
+    console.error("계정을 삭제하지 못했습니다.", error);
+    showToast(error.message || "계정을 삭제하지 못했습니다.");
+  } finally {
+    button.disabled = false;
+  }
+});
 
 $("#start-app").addEventListener("click", async event => {
   persistPreferences();
