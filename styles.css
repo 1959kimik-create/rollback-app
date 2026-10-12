@@ -123,6 +123,10 @@ input::placeholder { color: #b3b4ad; }
 .map-event-marker { pointer-events: all; cursor: pointer; }
 .map-event-marker:focus-visible { outline: none; stroke: #1d3025; stroke-width: 4; }
 .map-attribution { position: absolute; z-index: 2; right: 3px; bottom: 3px; padding: 2px 4px; color: #345d4d; background: rgba(255,255,255,.82); font-size: 9px; text-decoration: none; }
+.map-locate-button { position: absolute; z-index: 3; right: 10px; bottom: 10px; padding: 7px 10px; border: 1px solid rgba(52,93,77,.2); border-radius: 18px; color: #fff; background: rgba(40,75,61,.94); box-shadow: 0 2px 8px #20282033; cursor: pointer; font-size: 10px; font-weight: 600; }
+.map-locate-button:hover { background: #284b3d; }
+.map-locate-button:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+.map-locate-button[hidden] { display: none; }
 .map-message { position: absolute; z-index: 2; top: 50%; left: 50%; width: max-content; max-width: calc(100% - 24px); margin: 0; padding: 8px 10px; border-radius: 3px; color: #5f665d; background: rgba(255,255,255,.92); font-size: 10px; line-height: 1.5; text-align: center; transform: translate(-50%, -50%); }
 .map-message[hidden] { display: none; }
 .map-bottomline { padding-top: 9px; padding-bottom: 9px; }

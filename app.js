@@ -472,12 +472,21 @@ function renderMap(route, events, target, onEventClick) {
     attribution.target = "_blank";
     attribution.rel = "noreferrer";
     attribution.textContent = "© OpenStreetMap contributors";
-    target.replaceChildren(tiles, svg, message, attribution);
+    const locateButton = target.id === "map-canvas" ? document.createElement("button") : null;
+    if (locateButton) {
+      locateButton.type = "button";
+      locateButton.className = "map-locate-button";
+      locateButton.textContent = "◎ 현위치";
+      locateButton.setAttribute("aria-label", "현위치로 지도 이동");
+      locateButton.hidden = true;
+    }
+    target.replaceChildren(tiles, svg, message, attribution, ...(locateButton ? [locateButton] : []));
     map = {
       target,
       tiles,
       svg,
       message,
+      locateButton,
       tileCache: new Map(),
       route: [],
       events: [],
@@ -486,12 +495,21 @@ function renderMap(route, events, target, onEventClick) {
       height: 0,
       hasView: false,
       userInteracted: false,
+      followLocation: true,
       zoom: 3,
       centerWorld: null,
       pointers: new Map(),
       gesture: null
     };
     maps.set(target, map);
+    locateButton?.addEventListener("click", () => {
+      const currentPosition = map.route.at(-1);
+      if (!currentPosition) return;
+      map.userInteracted = true;
+      map.followLocation = true;
+      map.centerWorld = projectToWorld(currentPosition, map.zoom);
+      drawMap(map);
+    });
     installMapGestures(map);
     if ("ResizeObserver" in window) {
       map.resizeObserver = new ResizeObserver(() => drawMap(map));
@@ -527,7 +545,7 @@ function installMapGestures(map) {
 
   target.addEventListener("pointerdown", event => {
     if (!map.hasView || (event.pointerType === "mouse" && event.button !== 0)) return;
-    if (event.target instanceof Element && event.target.closest(".map-event-marker")) return;
+    if (event.target instanceof Element && event.target.closest(".map-event-marker, .map-locate-button")) return;
     const point = mapPoint(event);
     map.pointers.set(event.pointerId, point);
     if (target.setPointerCapture) target.setPointerCapture(event.pointerId);
@@ -547,6 +565,7 @@ function installMapGestures(map) {
       const deltaX = point.x - map.gesture.startPoint.x;
       const deltaY = point.y - map.gesture.startPoint.y;
       map.userInteracted = true;
+      map.followLocation = false;
       map.centerWorld = {
         x: map.gesture.startCenter.x - deltaX,
         y: map.gesture.startCenter.y - deltaY
@@ -565,6 +584,7 @@ function installMapGestures(map) {
         y: map.gesture.anchorWorld.y * scale - (midpoint.y - map.height / 2)
       };
       map.userInteracted = true;
+      map.followLocation = false;
       target.classList.add("is-dragging");
       drawMap(map);
     }
@@ -603,6 +623,7 @@ function installMapGestures(map) {
       y: anchorWorld.y * scale - (point.y - map.height / 2)
     };
     map.userInteracted = true;
+    map.followLocation = false;
     drawMap(map);
   }, { passive: false });
 }
@@ -633,9 +654,11 @@ function drawMap(map) {
     map.visibleTileKeys = [];
     map.hasView = false;
     map.userInteracted = false;
+    map.followLocation = true;
     map.centerWorld = null;
     map.pointers.clear();
     map.gesture = null;
+    if (map.locateButton) map.locateButton.hidden = true;
     target.classList.remove("is-interactive", "is-dragging");
     message.textContent = "경로를 기록하면 실제 지도가 표시됩니다.";
     message.hidden = false;
@@ -668,6 +691,17 @@ function drawMap(map) {
     const maxY = Math.max(...projected.map(point => point.y));
     map.zoom = zoom;
     map.centerWorld = { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
+  }
+
+  const currentPosition = route.at(-1);
+  if (currentPosition && map.locateButton && map.followLocation) {
+    const currentWorld = projectToWorld(currentPosition, map.zoom);
+    const currentX = currentWorld.x - (map.centerWorld.x - width / 2);
+    const currentY = currentWorld.y - (map.centerWorld.y - height / 2);
+    const margin = 16;
+    if (currentX < margin || currentX > width - margin || currentY < margin || currentY > height - margin) {
+      map.centerWorld = currentWorld;
+    }
   }
 
   const zoom = map.zoom;
@@ -725,6 +759,16 @@ function drawMap(map) {
     const position = projectToWorld(point, zoom);
     return { x: position.x - left, y: position.y - top };
   };
+  if (map.locateButton) {
+    if (!currentPosition) {
+      map.locateButton.hidden = true;
+    } else {
+      const position = pointAt(currentPosition);
+      const margin = 12;
+      map.locateButton.hidden = position.x >= margin && position.x <= width - margin
+        && position.y >= margin && position.y <= height - margin;
+    }
+  }
   if (route.length > 1) {
     const path = document.createElementNS(svg.namespaceURI, "polyline");
     path.setAttribute("points", route.map(point => {
@@ -1211,11 +1255,14 @@ function cleanupAudioCapture(capture) {
 async function finishVoiceRecording(body) {
   const capture = state.audioCapture;
   if (!capture) return;
+  $("#audio-stop", body).disabled = true;
+  $("#media-message", body).textContent = "녹음을 저장하고 있습니다...";
   const blob = encodeWav(capture.samples, capture.context.sampleRate);
   cleanupAudioCapture(capture);
   if (!blob.size || blob.size <= 44) {
     $("#media-message", body).textContent = "녹음 데이터가 비어 있어 파일을 만들지 못했습니다. 다시 녹음해 주세요.";
     $("#audio-start", body).disabled = false;
+    $("#audio-start", body).hidden = false;
     $("#audio-start", body).textContent = "다시 녹음";
     $("#audio-stop", body).disabled = true;
     $(".preview-placeholder", body).textContent = "녹음된 데이터가 없습니다.";
@@ -1223,6 +1270,48 @@ async function finishVoiceRecording(body) {
   }
   const event = addEvent("audio", blob, blob.type);
   await saveCapturedMedia(body, event, "음성 메모");
+}
+
+async function startVoiceRecording(body) {
+  const startButton = $("#audio-start", body);
+  const stopButton = $("#audio-stop", body);
+  startButton.disabled = true;
+  startButton.textContent = "마이크 연결 중...";
+  $("#media-message", body).textContent = "";
+  let stream = null;
+  let context = null;
+  try {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    state.modalStream = stream;
+    context = new AudioContextClass();
+    await context.resume();
+    const source = context.createMediaStreamSource(stream);
+    const processor = context.createScriptProcessor(4096, 1, 1);
+    const sink = context.createGain();
+    const capture = { stream, context, source, processor, sink, samples: [], stopped: false };
+    processor.onaudioprocess = event => {
+      if (!capture.stopped) capture.samples.push(new Float32Array(event.inputBuffer.getChannelData(0)));
+    };
+    source.connect(processor);
+    processor.connect(sink);
+    sink.connect(context.destination);
+    state.audioCapture = capture;
+    startButton.hidden = true;
+    stopButton.disabled = false;
+    $(".preview-placeholder", body).textContent = "● 녹음 중입니다. 생각을 천천히 들려주세요.";
+  } catch (error) {
+    if (state.audioCapture) cleanupAudioCapture(state.audioCapture);
+    else {
+      if (stream) stream.getTracks().forEach(track => track.stop());
+      if (context && context.state !== "closed") context.close();
+      state.modalStream = null;
+    }
+    startButton.disabled = false;
+    startButton.hidden = false;
+    startButton.textContent = "마이크 다시 연결";
+    $("#media-message", body).textContent = `마이크를 사용할 수 없습니다: ${error.message || "권한을 확인해 주세요."}`;
+  }
 }
 
 async function openVoiceModal() {
@@ -1233,43 +1322,10 @@ async function openVoiceModal() {
       : "음성 녹음은 HTTPS로 접속해야 사용할 수 있습니다.");
   }
   const body = openModal("음성 메모", "녹음을 마치면 설정한 저장 폴더에 자동 저장됩니다.");
-  body.innerHTML = '<div class="preview-placeholder">녹음을 시작하면 이 순간의 목소리를 담습니다.</div><p class="form-message" id="media-message" aria-live="polite"></p><div class="modal-actions"><button class="button button-dark button-wide" type="button" id="audio-start">녹음 시작</button><button class="button button-outline button-wide" type="button" id="audio-stop" disabled>녹음 종료 및 저장</button></div>';
-  $("#audio-start", body).addEventListener("click", async () => {
-    let stream = null;
-    let context = null;
-    try {
-      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      state.modalStream = stream;
-      context = new AudioContextClass();
-      await context.resume();
-      const source = context.createMediaStreamSource(stream);
-      const processor = context.createScriptProcessor(4096, 1, 1);
-      const sink = context.createGain();
-      const capture = { stream, context, source, processor, sink, samples: [], stopped: false };
-      processor.onaudioprocess = event => {
-        if (!capture.stopped) capture.samples.push(new Float32Array(event.inputBuffer.getChannelData(0)));
-      };
-      source.connect(processor);
-      processor.connect(sink);
-      sink.connect(context.destination);
-      state.modalStream = stream;
-      state.audioCapture = capture;
-      $("#audio-start", body).disabled = true;
-      $("#audio-start", body).textContent = "녹음 중...";
-      $("#audio-stop", body).disabled = false;
-      $(".preview-placeholder", body).textContent = "● 녹음 중입니다. 생각을 천천히 들려주세요.";
-    } catch (error) {
-      if (state.audioCapture) cleanupAudioCapture(state.audioCapture);
-      else {
-        if (stream) stream.getTracks().forEach(track => track.stop());
-        if (context && context.state !== "closed") context.close();
-        state.modalStream = null;
-      }
-      $("#media-message", body).textContent = `마이크를 사용할 수 없습니다: ${error.message || "권한을 확인해 주세요."}`;
-    }
-  });
+  body.innerHTML = '<div class="preview-placeholder">마이크 권한을 확인하고 녹음을 준비합니다.</div><p class="form-message" id="media-message" aria-live="polite"></p><div class="modal-actions"><button class="button button-outline button-wide" type="button" id="audio-start" hidden>마이크 다시 연결</button><button class="button button-dark button-wide" type="button" id="audio-stop" disabled>녹음 종료 및 저장</button></div>';
+  $("#audio-start", body).addEventListener("click", () => startVoiceRecording(body));
   $("#audio-stop", body).addEventListener("click", () => finishVoiceRecording(body));
+  await startVoiceRecording(body);
 }
 
 async function saveDraftOrSession() {
